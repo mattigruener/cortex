@@ -55,12 +55,14 @@ IECORE_EXPORT MStatus initializePlugin( MObject obj )
 
 	if (! g_libraryHandle )
 	{
+		printf("Failed to load '%s':\n%s\n", implName.c_str(), dlerror());
 		return MS::kFailure;
 	}
 
 	void *initializeSymbol = dlsym( g_libraryHandle, "_Z16initializePlugin7MObject" );
 	if ( ! initializeSymbol )
 	{
+		printf( "Unable to find symbol: initializePlugin(MObject)\n%s\n", dlerror() );
 		dlclose( g_libraryHandle );
 		g_libraryHandle = 0;
 		return MS::kFailure;
