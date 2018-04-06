@@ -76,7 +76,7 @@
 #include "IECoreMaya/SceneShape.h"
 #include "IECoreMaya/SceneShapeUI.h"
 #include "IECoreMaya/SceneShapeInterface.h"
-#include "IECoreMaya/SceneShapeGeometryOverride.h"
+#include "IECoreMaya/SceneShapeSubSceneOverride.h"
 
 // see ObjectParameterHandler::doUpdate() for an explanation of the necessity for dummy data
 static void *dummyDataCreator()
