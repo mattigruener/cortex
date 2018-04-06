@@ -45,6 +45,7 @@
 #include "maya/MPxImagePlane.h"
 #include "maya/MPxSurfaceShapeUI.h"
 #include "maya/MGlobal.h"
+#include "maya/MDrawRegistry.h"
 #undef None // must come after certain Maya includes which include X11/X.h
 
 #include "IECore/Parameterised.h"
@@ -75,6 +76,7 @@
 #include "IECoreMaya/SceneShape.h"
 #include "IECoreMaya/SceneShapeUI.h"
 #include "IECoreMaya/SceneShapeInterface.h"
+#include "IECoreMaya/SceneShapeSubSceneOverride.h"
 
 // see ObjectParameterHandler::doUpdate() for an explanation of the necessity for dummy data
 static void *dummyDataCreator()
@@ -129,11 +131,11 @@ MStatus initialize(MFnPlugin &plugin)
 		s = plugin.registerShape( ParameterisedHolderSurfaceShape::typeName, ParameterisedHolderSurfaceShape::id,
 			ParameterisedHolderSurfaceShape::creator, ParameterisedHolderSurfaceShape::initialize, []() -> void* { return new MPxSurfaceShapeUI; } );
 		assert( s );
-		
+
 		s = plugin.registerShape( ParameterisedHolderComponentShape::typeName, ParameterisedHolderComponentShape::id,
 			ParameterisedHolderComponentShape::creator, ParameterisedHolderComponentShape::initialize, []() -> void* { return new MPxSurfaceShapeUI; } );
 		assert( s );
- 
+
 		s = plugin.registerShape( DrawableHolder::typeName, DrawableHolder::id,
 			DrawableHolder::creator, DrawableHolder::initialize, DrawableHolderUI::creator );
 		assert( s );
@@ -143,7 +145,10 @@ MStatus initialize(MFnPlugin &plugin)
 		assert( s );
 
 		s = plugin.registerShape( "ieSceneShape", SceneShape::id,
-			SceneShape::creator, SceneShape::initialize, SceneShapeUI::creator );
+			SceneShape::creator, SceneShape::initialize, SceneShapeUI::creator, &SceneShapeSubSceneOverride::drawDbClassification() );
+		assert( s );
+
+		s = MHWRender::MDrawRegistry::registerSubSceneOverrideCreator( SceneShapeSubSceneOverride::drawDbClassification(), SceneShapeSubSceneOverride::drawDbId(), SceneShapeSubSceneOverride::Creator );
 		assert( s );
 
 		s = plugin.registerNode( "ieOpHolderNode", OpHolderNode::id,
