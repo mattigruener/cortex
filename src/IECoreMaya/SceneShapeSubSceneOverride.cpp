@@ -84,10 +84,14 @@ RenderStyle& operator++( RenderStyle& style )
 		return style = RenderStyle::Solid;
 
 	case RenderStyle::Solid:
+		return style = RenderStyle::Textured;
+
+	case RenderStyle::Textured:
 		return style = RenderStyle::Last;
 
 	case RenderStyle::Last:
 		return style = RenderStyle::BoundingBox;
+
 	default:
 		return style;
 
@@ -338,6 +342,8 @@ void fillGeometryData( ConstMeshPrimitivePtr meshPrimitive, const MVertexBufferD
 	{
 		void* positionData = nullptr;
 		MVertexBuffer *positionBuffer = nullptr;
+		MVertexBufferDescriptor positionDescriptor( "", MGeometry::kPosition, MGeometry::kFloat, 3 );
+
 		const std::vector<Imath::V3f> &positionsReadable = p->readable();
 		for( int i = 0; i < descriptorList.length(); ++i )
 		{
@@ -345,11 +351,13 @@ void fillGeometryData( ConstMeshPrimitivePtr meshPrimitive, const MVertexBufferD
 			descriptorList.getDescriptor( i, descriptor );
 			if( descriptor.semantic() == MGeometry::kPosition )
 			{
-				positionBuffer = new MVertexBuffer( descriptor );
-				positionData = positionBuffer->acquire( positionsReadable.size(), true );
+				positionDescriptor = descriptor;
 				break;
 			}
 		}
+
+		positionBuffer = new MVertexBuffer( positionDescriptor );
+		positionData = positionBuffer->acquire( positionsReadable.size(), true );
 
 		if( positionData && positionBuffer )
 		{
@@ -363,6 +371,8 @@ void fillGeometryData( ConstMeshPrimitivePtr meshPrimitive, const MVertexBufferD
 	{
 		void* normalData = nullptr;
 		MVertexBuffer *normalBuffer = nullptr;
+		MVertexBufferDescriptor normalDescriptor( "", MGeometry::kNormal, MGeometry::kFloat, 3 );
+
 		const std::vector<Imath::V3f> &normalsReadable = n->readable();
 		for( int i = 0; i < descriptorList.length(); ++ i )
 		{
@@ -370,11 +380,13 @@ void fillGeometryData( ConstMeshPrimitivePtr meshPrimitive, const MVertexBufferD
 			descriptorList.getDescriptor( i, descriptor );
 			if( descriptor.semantic() == MGeometry::kNormal )
 			{
-				normalBuffer = new MVertexBuffer( descriptor );
-				normalData = normalBuffer->acquire( normalsReadable.size(), true );
+				normalDescriptor = descriptor;
 				break;
 			}
 		}
+
+		normalBuffer = new MVertexBuffer( normalDescriptor );
+		normalData = normalBuffer->acquire( normalsReadable.size(), true );
 
 		if( normalData && normalBuffer )
 		{
@@ -389,19 +401,24 @@ void fillGeometryData( ConstMeshPrimitivePtr meshPrimitive, const MVertexBufferD
 		void* uvData = nullptr;
 		MVertexBuffer *uvBuffer = nullptr;
 		const std::vector<Imath::V2f> &uvReadable = uv->readable();
+
+		// default descriptor which might not be correct \todo
+		MVertexBufferDescriptor uvDescriptor( "", MGeometry::kTexture, MGeometry::kFloat, 2 );
+		// MVertexBufferDescriptor uvDescriptor( "uvCoord", MGeometry::kTexture, "mayauvcoordsemantic", MGeometry::kFloat, 2 );
+
 		for( int i = 0; i < descriptorList.length(); ++ i )
 		{
 			MVertexBufferDescriptor descriptor;
 			descriptorList.getDescriptor( i, descriptor );
 			if( descriptor.semantic() == MGeometry::kTexture )
 			{
-				uvBuffer = new MVertexBuffer( descriptor );
-				uvData = uvBuffer->acquire( uvReadable.size(), true );
-				// MVertexBufferDescriptor uvDescriptor( "uvCoord", MGeometry::kTexture, "mayauvcoordsemantic", MGeometry::kFloat, 2 );
-				// MVertexBufferDescriptor uvDescriptor( "", MGeometry::kTexture, MGeometry::kFloat, 2 );
+				uvDescriptor = descriptor;
 				break;
 			}
 		}
+
+		uvBuffer = new MVertexBuffer( uvDescriptor );
+		uvData = uvBuffer->acquire( uvReadable.size(), true );
 
 		if( uvData && uvBuffer )
 		{
@@ -549,12 +566,12 @@ RenderItemWrapperPtr renderItemGetter( const RenderItemWrapperCacheGetterKey &ke
 		geometryData = g_geometryDataCache.get( GeometryDataCacheGetterKey( key.m_meshPrimitive, renderItem->requiredVertexBuffers() ) );
 		key.m_sceneShape->setGeometryForRenderItem( *renderItem, *(geometryData->vertexBufferArray), *(geometryData->wireframeIndexBuffer), &bbox );
 	}
-	else if( key.m_style == RenderStyle::Solid )
+	else if( key.m_style == RenderStyle::Solid || key.m_style == RenderStyle::Textured )
 	{
 		MString name( (key.m_name + "_s").c_str() );
 		renderItem = MRenderItem::Create( name, MRenderItem::MaterialSceneItem, MGeometry::kTriangles );
 
-		renderItem->setDrawMode( MGeometry::kAll ); // TODO: what about textured?
+		renderItem->setDrawMode( (key.m_style == RenderStyle::Solid) ? MGeometry::kShaded : MGeometry::kTextured ); // TODO: what about textured?
 		renderItem->castsShadows( true );
 		renderItem->receivesShadows( true );
 		renderItem->setExcludedFromPostEffects( true );
@@ -857,16 +874,21 @@ void SceneShapeSubSceneOverride::update( MSubSceneContainer& container, const MF
 
 	// Perform update
 	{
-		// IECore::ScopedTimer visitLocationsTimer( "visitingLocations" );
+		IECore::ScopedTimer visitLocationsTimer( "visitingLocations" );
 
 		m_renderItems.clear();
 
+		printf( "state before updating %i %i %i \n", (int)m_styleMask.test( 0 ), (int)m_styleMask.test( 1 ), (int)m_styleMask.test( 2 ) );
 		// Gather geometry to render into m_renderItems
+
+		container.clear(); // Clear out previous render items so that they don't interfere with new ones.
+
 		visitSceneLocations( m_sceneInterface, container, matrices, Imath::M44d(), /* isRoot = */ true );
 
 		container.clear(); // MRenderItems might have been added temporarily so that Maya lets us fill them
 
 		// Actually add all gathered MRenderItems
+		printf( "Will add %i render items.\n", (int)m_renderItems.size() );
 		for( auto namedRenderItem : m_renderItems )
 		{
 			auto itemAndMatrices = namedRenderItem.second;
@@ -877,15 +899,17 @@ void SceneShapeSubSceneOverride::update( MSubSceneContainer& container, const MF
 				continue;
 			}
 
-			renderItem->enable( true );
+			// \todo
+			// renderItem->enable( true );
 			container.add( renderItem );
 
 			// note: the following is true for all entries if
 			// !m_instancedRendering because we're creating a separate
 			// render item per instance
+			//printf( "instances: %i\n", (int)itemAndMatrices.second.length() );
 			if( itemAndMatrices.second.length() == 1 )
 			{
-				renderItem->setWantSubSceneConsolidation( true );
+				// renderItem->setWantSubSceneConsolidation( true );
 				renderItem->setMatrix( &itemAndMatrices.second[0] );
 			}
 			else
@@ -1035,22 +1059,42 @@ void SceneShapeSubSceneOverride::visitSceneLocations( ConstSceneInterfacePtr sce
 	for( RenderStyle style = RenderStyle::BoundingBox; style != RenderStyle::Last; ++style )
 	{
 		IECore::ScopedTimer fooI( "fillingRenderItem", "fillingRenderItem" );
-		if( !m_styleMask.test( (int)style ) )
-		{
-			continue;
-		}
 
+		// based on style, sort out shading and visibility, and potential skipping to improve performance
 		MShaderInstance *shader = nullptr;
-		if( style == RenderStyle::Solid )
+		bool visibility = true;
+		if( style == RenderStyle::BoundingBox )
 		{
-			// \todo: this should be able to differentiate between textured and non-textured rendering.
-			//        getAssignedSurfaceShader should potentially return a pair of shaders so that the
-			//        caller can decide which version to use.
-			shader = getAssignedSurfaceShader();
+			// we always compute bounding boxes - no skipping required.
+			shader = getWireShader();
+			visibility = m_styleMask.test( (int)RenderStyle::BoundingBox );
 		}
 		else
 		{
-			shader = getWireShader();
+			// if only bounding boxes are requested, don't create anything else
+			if( !m_styleMask.test( (int)RenderStyle::Wireframe ) && !m_styleMask.test( (int)RenderStyle::Solid ) )
+			{
+				continue;
+			}
+
+			if( style == RenderStyle::Solid || style == RenderStyle::Textured )
+			{
+				ShaderPair shaders = getAssignedSurfaceShader();
+				shader = (style == RenderStyle::Solid) ? shaders.first : shaders.second;
+			}
+			else
+			{
+				shader = getWireShader();
+			}
+
+			if( style == RenderStyle::Textured )
+			{
+				visibility = m_styleMask.test( (int)RenderStyle::Solid );
+			}
+			else
+			{
+				visibility = m_styleMask.test( (int)style );
+			}
 		}
 
 		// When rendering instances, we gather all matrices and associate them
@@ -1065,12 +1109,13 @@ void SceneShapeSubSceneOverride::visitSceneLocations( ConstSceneInterfacePtr sce
 		// them when it sees fit (for example when clearing the container Maya
 		// gave us).
 
+		MRenderItem *storageCopy = nullptr;
 		if( m_instancedRendering )
 		{
 			RenderItemWrapperCacheGetterKey key( this, name, meshPrimitive.get(), style, container, shader, /* hashName = */ false );
 			RenderItemWrapperPtr renderItemWrapper = g_renderItemCache.get( key );
 
-			MRenderItem *storageCopy = MRenderItem::Create( *(renderItemWrapper->renderItem()) );
+			storageCopy = MRenderItem::Create( *(renderItemWrapper->renderItem()) );
 			std::string name = storageCopy->name().asChar();
 
 			for( const auto &rootMatrix : rootMatrices )
@@ -1082,18 +1127,21 @@ void SceneShapeSubSceneOverride::visitSceneLocations( ConstSceneInterfacePtr sce
 		else
 		{
 			int count = 0;
+			std::string instanceBaseName = name + "_" + std::to_string( (int)style ) + "_";
 			for( const auto &rootMatrix : rootMatrices )
 			{
-				std::string instanceName = name + "_" + std::to_string( (int)style ) + "_" + std::to_string( count++ );
+				std::string instanceName = instanceBaseName + std::to_string( count++ );
 				MMatrix instanceMatrix = IECore::convert<MMatrix, Imath::M44d>( accumulatedMatrix * rootMatrix );
 
 				RenderItemWrapperCacheGetterKey key( this, instanceName, meshPrimitive.get(), style, container, shader, /* hashName = */ true );
 				RenderItemWrapperPtr renderItemWrapper = g_renderItemCache.get( key );
 
-				MRenderItem *storageCopy = MRenderItem::Create( *(renderItemWrapper->renderItem()) );
-				appendMatrixToRenderItem( instanceName, storageCopy, instanceMatrix );
+				storageCopy = MRenderItem::Create( *(renderItemWrapper->renderItem()) );
+				appendMatrixToRenderItem( instanceName, storageCopy, instanceMatrix );  // note that the name is unique
 			}
 		}
+
+		storageCopy->enable( visibility );
 	}
 }
 
@@ -1124,22 +1172,22 @@ MShaderInstance* SceneShapeSubSceneOverride::getWireShader()
 }
 
 
-MShaderInstance* SceneShapeSubSceneOverride::getAssignedSurfaceShader()
+SceneShapeSubSceneOverride::ShaderPair SceneShapeSubSceneOverride::getAssignedSurfaceShader()
 {
-	static MShaderInstance *shader = nullptr;
+	static ShaderPair shaders = std::make_pair( nullptr, nullptr );
 
-	if( !shader || m_materialIsDirty )
+	if( !shaders.first || !shaders.second || m_materialIsDirty )
 	{
 		MRenderer* renderer = MRenderer::theRenderer();
 		if( !renderer )
 		{
-			return nullptr;
+			return shaders;
 		}
 
 		const MShaderManager* shaderManager = renderer->getShaderManager();
 		if( !shaderManager )
 		{
-			return nullptr;
+			return shaders;
 		}
 
 		MObjectArray sets, components;
@@ -1149,7 +1197,7 @@ MShaderInstance* SceneShapeSubSceneOverride::getAssignedSurfaceShader()
 
 		if( !node.getConnectedSetsAndMembers( 0, sets, components, true ) )
 		{
-			return nullptr;
+			return shaders;
 		}
 
 		for (unsigned int i = 0; i < sets.length(); i++)
@@ -1173,14 +1221,15 @@ MShaderInstance* SceneShapeSubSceneOverride::getAssignedSurfaceShader()
 
 			if( connectedPlugs.length() >= 1 )
 			{
-				// \todo: also provide the non-textured version of the shader.
-				shader = shaderManager->getShaderFromNode( connectedPlugs[0].node(), instances[0] );
+				MShaderInstance *gray = shaderManager->getShaderFromNode( connectedPlugs[0].node(), instances[0], 0, 0, 0, 0, /*nonTextured = */ true );
+				MShaderInstance *textured = shaderManager->getShaderFromNode( connectedPlugs[0].node(), instances[0], 0, 0, 0, 0, /*nonTextured = */ false );
+				shaders = std::make_pair( gray, textured );
 				break;
 			}
 		}
 	}
 
-	return shader;
+	return shaders;
 }
 
 // Convenience function that should eventually help with also rendering all instances generated by instancers.

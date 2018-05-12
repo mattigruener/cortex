@@ -52,7 +52,7 @@
 namespace IECoreMaya
 {
 
-enum class RenderStyle { BoundingBox, Wireframe, Solid, Last };
+enum class RenderStyle { BoundingBox, Wireframe, Solid, Textured, Last };
 
 // Smart pointers for Maya's buffers for automatic clean-up
 using IndexBufferPtr = std::shared_ptr<MHWRender::MIndexBuffer> ;
@@ -210,7 +210,8 @@ class IECOREMAYA_API SceneShapeSubSceneOverride : public MHWRender::MPxSubSceneO
 		void visitSceneLocations( IECoreScene::ConstSceneInterfacePtr sceneInterface, MHWRender::MSubSceneContainer &container, const std::vector<Imath::M44d> &rootMatrices, const Imath::M44d &matrix, bool isRoot = false );
 
 		MHWRender::MShaderInstance* getWireShader();
-		MHWRender::MShaderInstance* getAssignedSurfaceShader();
+		typedef std::pair<MHWRender::MShaderInstance*, MHWRender::MShaderInstance*> ShaderPair;
+		ShaderPair getAssignedSurfaceShader();
 
 		MObjectArray getConnectedInstancers() const;
 
