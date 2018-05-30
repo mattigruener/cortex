@@ -50,99 +50,16 @@
 #include "maya/MPxSubSceneOverride.h"
 #include "maya/MSelectionContext.h"
 
+namespace
+{
+}
+
 namespace IECoreMaya
 {
 
 enum class RenderStyle { BoundingBox, Wireframe, Solid, Textured, Last };
 
-// Smart pointers for Maya's buffers for automatic clean-up
-using IndexBufferPtr = std::shared_ptr<MHWRender::MIndexBuffer> ;
-using VertexBufferArrayPtr = std::shared_ptr<MHWRender::MVertexBufferArray>;
-
-// struct BoundData
-// {
-// 	BoundData()
-// 		: vertexBufferArray( new MHWRender::MVertexBufferArray )
-// 	{
-// 	}
-
-// 	~BoundData()
-// 	{
-// 		for( unsigned int i = 0; i < vertexBufferArray->count(); ++i )
-// 		{
-// 			delete vertexBufferArray->getBuffer( i );
-// 		}
-// 		vertexBufferArray->clear();
-// 	}
-
-// 	std::shared_ptr<MHWRender::MVertexBufferArray> vertexBufferArray;
-// 	IndexBufferPtr wireframeIndexBuffer;
-// };
-
-// using BoundDataPtr = std::shared_ptr<BoundData>;
-
-struct GeometryData
-{
-	GeometryData()
-		: vertexBufferArray( new MHWRender::MVertexBufferArray )
-	{
-	}
-
-	~GeometryData()
-	{
-		for( unsigned int i = 0; i < vertexBufferArray->count(); ++i )
-		{
-			delete vertexBufferArray->getBuffer( i );
-		}
-		vertexBufferArray->clear();
-	}
-
-	std::shared_ptr<MHWRender::MVertexBufferArray> vertexBufferArray;
-	IndexBufferPtr indexBuffer;
-	IndexBufferPtr wireframeIndexBuffer;
-};
-
-using GeometryDataPtr = std::shared_ptr<GeometryData>;
-
-// \todo: use an alias with std::shared_ptr instead of custom stuff
-class IECOREMAYA_API RenderItemWrapper : public IECore::RefCounted
-{
- public:
-	RenderItemWrapper( MHWRender::MRenderItem *renderItem, GeometryDataPtr geometryData );
-	~RenderItemWrapper();
-
-	MHWRender::MRenderItem* renderItem() { return m_renderItem; }
-	GeometryDataPtr geometryData() { return m_geometryData; }
-
- private:
-	MHWRender::MRenderItem *m_renderItem;
-	GeometryDataPtr m_geometryData;
-
-};
-
-IE_CORE_DECLAREPTR( RenderItemWrapper );
-
-typedef std::bitset<3> StyleMask;
-
-class Instance
-{
- public:
- Instance( Imath::M44d transformation, bool selected, bool componentMode, MDagPath path )
-	 : transformation( transformation ), selected( selected ), componentMode( componentMode ), path( path )
-	{}
-
-	bool operator==( const Instance &rhs ) const
-	{
-		return transformation == rhs.transformation && selected == rhs.selected && path == rhs.path && componentMode == rhs.componentMode;
-	}
-
-	Imath::M44d transformation;
-	bool selected;
-	bool componentMode;
-	MDagPath path;
-};
-
-typedef std::vector<Instance> Instances;
+using RenderItemMap = std::map<const std::string, std::pair<MHWRender::MRenderItem*, MMatrixArray> >;
 
 class IECOREMAYA_API SceneShapeSubSceneOverride : public MHWRender::MPxSubSceneOverride
 {
@@ -150,15 +67,22 @@ class IECOREMAYA_API SceneShapeSubSceneOverride : public MHWRender::MPxSubSceneO
 
 		static MString& drawDbClassification();
 		static MString& drawDbId();
-
 		static MHWRender::MPxSubSceneOverride* Creator( const MObject& obj );
 
 		~SceneShapeSubSceneOverride() override;
 
+		// Maya calls this to determine if `update` needs to be called at all for this refresh. Gets called a lot.
 		bool requiresUpdate(const MHWRender::MSubSceneContainer& container, const MHWRender::MFrameContext& frameContext) const override;
+
+		// Performing the actual updating. Needs to fill given container with MRenderItem objects for drawing.
 		void update(MHWRender::MSubSceneContainer&  container, const MHWRender::MFrameContext& frameContext) override;
+
+		// We are responsible for drawing all instances. Maya therefore refers to
+		// us for figuring out which instance was selected when the user clicks
+		// on one of our MRenderItems.
 		bool getInstancedSelectionPath( const MHWRender::MRenderItem &renderItem, const MHWRender::MIntersection &intersection, MDagPath &dagPath ) const override;
-		// \todo: remove?
+
+		// Maya allows us to switch between object and component selection by changing the MSelectionContext.
 		void updateSelectionGranularity( const MDagPath &path, MHWRender::MSelectionContext &selectionContext ) override;
 
 		MHWRender::DrawAPI supportedDrawAPIs() const override;
@@ -169,38 +93,50 @@ class IECOREMAYA_API SceneShapeSubSceneOverride : public MHWRender::MPxSubSceneO
 
 	private :
 
-		// traverse the scene and create MRenderItems as necessary
-		void visitSceneLocations( IECoreScene::ConstSceneInterfacePtr sceneInterface, MHWRender::MSubSceneContainer &container, const Imath::M44d &matrix, bool isRoot = false );
+		struct Instance
+		{
+			Instance( Imath::M44d transformation, bool selected, bool componentMode, MDagPath path )
+				: transformation( transformation ), selected( selected ), componentMode( componentMode ), path( path )
+			{
+			}
 
-		// shaders usually come in two flavours: non-textured/textured or deselected/selected
-		typedef std::pair<MHWRender::MShaderInstance*, MHWRender::MShaderInstance*> ShaderPair;
+			bool operator==( const Instance &rhs ) const
+			{
+				return transformation == rhs.transformation && selected == rhs.selected && path == rhs.path && componentMode == rhs.componentMode;
+			}
 
-		ShaderPair getWireShaders() const;
-		ShaderPair getComponentWireShaders() const;
-		ShaderPair getAssignedSurfaceShaders();
-		MHWRender::MShaderInstance *getShader( RenderStyle style, const Instance &instance, const std::string &location );
+			Imath::M44d transformation;
+			bool selected;
+			bool componentMode;
+			MDagPath path;
+		};
 
-		MObjectArray getConnectedInstancers() const;
+		using Instances = std::vector<Instance>;
 
-		void appendMatrixToRenderItem( const std::string &name, MHWRender::MRenderItem *renderItem, MMatrix instanceMatrix );
-		bool sceneIsAnimated() const;
+		// Traverse the scene and create MRenderItems as necessary while collecting all matrices to be associated with them.
+		void visitSceneLocations( IECoreScene::ConstSceneInterfacePtr sceneInterface, RenderItemMap &renderItems, MHWRender::MSubSceneContainer &container, const Imath::M44d &matrix, bool isRoot = false );
+
+		// Provide information about the instances that need drawing as
+		// SubSceneOverrides are responsible for drawing all instances of the
+		// shape, which is different to how things were handled in Maya's VP1.
 		void gatherInstanceInformation( Instances &instances, bool globalWireframeDrawing ) const;
 
-		// retrieve global display settings (can be overridden by instances)
+		// Retrieve global display settings (can be locally overridden by instances)
 		bool renderAllBounds( unsigned int displayStyle ) const;
 		bool renderAllWireframes( unsigned int displayStyle ) const;
 		bool renderAllShaded( unsigned int displayStyle ) const;
 
+		// Get all component indices that are currently selected. Useful for
+		// determining both selection changes and rendering states of these
+		// components.
 		void selectedComponentIndices( std::set<int> &selectedComponents ) const;
-		bool componentsSelectable( const MDagPath &path ) const;
-
-		Imath::M44d worldTransform( const IECoreScene::SceneInterface *scene, double time ) const;
 
 		SceneShape *m_sceneShape;
 
 		std::string m_drawTagsFilter;
 		double m_time;
 
+		using StyleMask = std::bitset<3>;
 		StyleMask m_styleMask; // \todo: now that things are simpler, consider replacing this with three bools.
 		Instances m_instances;
 
@@ -209,13 +145,9 @@ class IECOREMAYA_API SceneShapeSubSceneOverride : public MHWRender::MPxSubSceneO
 		bool m_materialIsDirty;
 		bool m_instancedRendering;
 		IECoreScene::ConstSceneInterfacePtr m_sceneInterface;
-		bool m_componentsSelectable;
-		bool m_wireframeInstanceOverride;
 
-		std::map<const std::string, std::pair<MHWRender::MRenderItem*, MMatrixArray> > m_renderItems;
-		std::map<const std::string, MDagPath> m_itemToPathMap;
+		std::map<const std::string, MDagPath> m_renderItemNameToDagPath;
 		std::set<int> m_selectedComponents;
-
 };
 
 } // namespace IECoreMaya

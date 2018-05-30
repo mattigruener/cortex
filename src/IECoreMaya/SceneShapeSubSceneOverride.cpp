@@ -80,67 +80,136 @@ using namespace MHWRender;
 namespace
 {
 
+struct GeometryData
+{
+	public :
+		GeometryData()
+			: vertexBufferArray( new MHWRender::MVertexBufferArray )
+		{
+		}
+
+		~GeometryData()
+		{
+			for( unsigned int i = 0; i < vertexBufferArray->count(); ++i )
+			{
+				delete vertexBufferArray->getBuffer( i );
+			}
+			vertexBufferArray->clear();
+		}
+
+		// Indices can be shared between GeometryData objects. While not being
+		// implemented currently, we should share topology buffers between
+		// GeometryData instances that represent an animated/deformed mesh.
+		using IndexBufferPtr = std::shared_ptr<MHWRender::MIndexBuffer> ;
+
+		// While we could share actual buffers (if we add Pref at some point, for
+		// example), the array itself that we pass to Maya is unique.
+		using VertexBufferArrayPtr = std::unique_ptr<MHWRender::MVertexBufferArray>;
+
+		VertexBufferArrayPtr vertexBufferArray;
+		IndexBufferPtr indexBuffer;
+		IndexBufferPtr wireframeIndexBuffer;
+};
+
+using GeometryDataPtr = std::shared_ptr<GeometryData>;
+
+// Wrap Maya's MRenderItem so that we get a shareable pointer that we can return
+// from a cache. This is intended to only ever hold MRenderItem's that Maya are
+// not going to see as those need separate cleaning up.
+// \todo is this specifier needed?
+class IECOREMAYA_API RenderItemWrapper : public IECore::RefCounted
+{
+	public :
+
+		RenderItemWrapper( MHWRender::MRenderItem *renderItem, GeometryDataPtr geometryData )
+			: m_renderItem( renderItem ), m_geometryData( geometryData )
+		{
+		}
+
+		~RenderItemWrapper()
+		{
+			MRenderItem::Destroy( m_renderItem );
+		}
+
+		MHWRender::MRenderItem* get() { return m_renderItem; }
+
+	private :
+
+		MHWRender::MRenderItem *m_renderItem;
+
+		// Holding on to this in order to ensure the geometry data we've passed
+		// to the render item is kept alive for as long as someone might take
+		// copies of this render item.
+		GeometryDataPtr m_geometryData;
+};
+
+IE_CORE_DECLAREPTR( RenderItemWrapper );
+
 class RenderItemUserData : public MUserData
 {
-public:
-	RenderItemUserData( int componentIndex )
-		: MUserData( true ),  // delete when render item is deleted
-		  componentIndex( componentIndex )
-	{}
+	public :
 
-	virtual ~RenderItemUserData()
-	{
+		RenderItemUserData( int componentIndex )
+			: MUserData( true ),  // delete when render item is deleted
+			  componentIndex( componentIndex )
+		{
+		}
 
-	}
+		virtual ~RenderItemUserData()
+		{
+		}
 
-	int componentIndex;
+		int componentIndex;
 };
 
 // As we render a render item per component, all we need to know here is the
 // component index per render item.
 class ComponentConverter : public MPxComponentConverter
 {
-public:
+	public :
 
-	static MPxComponentConverter *creator()
-	{
-		return new ComponentConverter();
-	}
+		static MPxComponentConverter *creator()
+		{
+			return new ComponentConverter();
+		}
 
-	ComponentConverter()
-		: MHWRender::MPxComponentConverter()
-	{};
+		ComponentConverter()
+			: MHWRender::MPxComponentConverter()
+		{
+		}
 
-	~ComponentConverter() override {};
+		~ComponentConverter() override
+		{
+		}
 
-	void initialize( const MRenderItem &renderItem ) override
-	{
-		RenderItemUserData* userData = dynamic_cast<RenderItemUserData*>(renderItem.customData());
-		m_idx = userData->componentIndex;
+		void initialize( const MRenderItem &renderItem ) override
+		{
+			RenderItemUserData* userData = dynamic_cast<RenderItemUserData*>(renderItem.customData());
+			m_idx = userData->componentIndex;
 
-		m_object = m_component.create( MFn::kMeshPolygonComponent );
-	}
+			m_object = m_component.create( MFn::kMeshPolygonComponent );
+		}
 
-	void addIntersection( MIntersection &intersection ) override
-	{
-		m_component.addElement( m_idx );
-	}
+		void addIntersection( MIntersection &intersection ) override
+		{
+			m_component.addElement( m_idx );
+		}
 
-	MObject component()
-	{
-		return m_object;
-	}
+		MObject component()
+		{
+			return m_object;
+		}
 
-	MSelectionMask 	selectionMask () const override
-	{
-		return MSelectionMask::kSelectMeshFaces;
-	}
+		MSelectionMask 	selectionMask () const override
+		{
+			return MSelectionMask::kSelectMeshFaces;
+		}
 
-private:
+	private :
 
-	MFnSingleIndexedComponent m_component;
-	MObject m_object;
-	int m_idx;
+		MFnSingleIndexedComponent m_component;
+		MObject m_object;
+		int m_idx;
 };
 
 bool objectCanBeRendered( IECore::ConstObjectPtr object )
@@ -836,9 +905,11 @@ RenderItemWrapperPtr renderItemGetter( const RenderItemWrapperCacheGetterKey &ke
 		throw( IECore::Exception( boost::str( boost::format( "Could not create MRenderItem %1%." ) % key.m_name ) ) );
 	}
 
+	// Return a copy that can be handed to Maya. We will not give up our
+	// internal copy as it's too easy to accidentally get it cleaned up by Maya.
+	RenderItemWrapperPtr visibleCopy( new RenderItemWrapper( MRenderItem::Create( *renderItem ), geometryData ) );
 
-	RenderItemWrapperPtr renderItemWrapper( new RenderItemWrapper( MRenderItem::Create( *renderItem ), geometryData ) );
-	return renderItemWrapper;
+	return visibleCopy;
 }
 
 using RenderItemCache = IECore::LRUCache<IECore::MurmurHash, RenderItemWrapperPtr, IECore::LRUCachePolicy::Parallel, RenderItemWrapperCacheGetterKey>;
@@ -903,6 +974,275 @@ bool isPathSelected( const MSelectionList &selectionList, const MDagPath &path )
 	return false;
 }
 
+struct SelectionStateShaders
+{
+	SelectionStateShaders( MHWRender::MShaderInstance *unselected, MHWRender::MShaderInstance *selected )
+		: unselected( unselected ), selected( selected )
+	{
+	}
+
+	MHWRender::MShaderInstance *unselected;
+	MHWRender::MShaderInstance *selected;
+};
+
+struct TextureStateShaders
+{
+	TextureStateShaders( MHWRender::MShaderInstance *untextured, MHWRender::MShaderInstance *textured )
+		: untextured( untextured ), textured( textured )
+	{
+	}
+
+	MHWRender::MShaderInstance *untextured;
+	MHWRender::MShaderInstance *textured;
+};
+
+SelectionStateShaders getWireShaders()
+{
+	static SelectionStateShaders shaders( nullptr, nullptr );
+
+	if( !shaders.unselected || !shaders.selected )
+	{
+		MRenderer* renderer = MRenderer::theRenderer();
+		if( !renderer )
+		{
+			return shaders;
+		}
+
+		const MShaderManager* shaderManager = renderer->getShaderManager();
+		if( !shaderManager )
+		{
+			return shaders;
+		}
+
+		shaders.unselected = shaderManager->getStockShader( MShaderManager::k3dSolidShader );
+		shaders.selected = shaders.unselected->clone();
+
+		MDoubleArray a, b;
+		MGlobal::executeCommand( "colorIndex -q 19", a );
+		MGlobal::executeCommand( "colorIndex -q 5", b );
+
+		const float highlightedWireColor[] = {(float)a[0], (float)a[1], (float)a[2], 1.0f};
+		const float unhighlightedWireColor[] = {(float)b[0], (float)b[1], (float)b[2], 1.0f};
+
+		shaders.unselected->setParameter("solidColor", unhighlightedWireColor );
+		shaders.selected->setParameter("solidColor", highlightedWireColor );
+	}
+
+	return shaders;
+}
+
+SelectionStateShaders getComponentWireShaders()
+{
+	static SelectionStateShaders shaders( nullptr, nullptr );
+
+	if( !shaders.unselected || !shaders.selected )
+	{
+		MRenderer* renderer = MRenderer::theRenderer();
+		if( !renderer )
+		{
+			return shaders;
+		}
+
+		const MShaderManager* shaderManager = renderer->getShaderManager();
+		if( !shaderManager )
+		{
+			return shaders;
+		}
+
+		MDoubleArray a, b;
+		MGlobal::executeCommand( "colorIndex -q 21", a );
+		MGlobal::executeCommand( "colorIndex -q 18", b );
+
+		const float highlightedWireColor[] = {(float)a[0], (float)a[1], (float)a[2], 1.0f};
+		const float unhighlightedWireColor[] = {(float)b[0], (float)b[1], (float)b[2], 1.0f};
+
+		shaders.unselected = shaderManager->getStockShader( MShaderManager::k3dSolidShader );
+		shaders.selected = shaders.unselected->clone();
+
+		shaders.unselected->setParameter("solidColor", unhighlightedWireColor );
+		shaders.selected->setParameter("solidColor", highlightedWireColor );
+	}
+
+	return shaders;
+}
+
+TextureStateShaders getAssignedSurfaceShaders( MObject object )
+{
+	TextureStateShaders shaders( nullptr, nullptr );
+
+	MRenderer* renderer = MRenderer::theRenderer();
+	if( !renderer )
+	{
+		return shaders;
+	}
+
+	const MShaderManager* shaderManager = renderer->getShaderManager();
+	if( !shaderManager )
+	{
+		return shaders;
+	}
+
+	MStatus s;
+	MFnDagNode node( object, &s );
+	if( !s )
+	{
+		return shaders;
+	}
+
+	MDagPathArray instances;
+	node.getAllPaths( instances );
+
+	MPlug shaderOutPlug = getShaderOutPlug( object );
+
+	if( !shaderOutPlug.isNull() )
+	{
+		shaders.untextured = shaderManager->getShaderFromNode( shaderOutPlug.node(), instances[0], 0, 0, 0, 0, /* nonTextured = */ true );
+		shaders.textured = shaderManager->getShaderFromNode( shaderOutPlug.node(), instances[0], 0, 0, 0, 0, /* nonTextured = */ false );
+	}
+	else
+	{
+		shaders.untextured = shaderManager->getStockShader( MShaderManager::MStockShader::k3dDefaultMaterialShader );
+		shaders.textured = shaders.untextured;
+	}
+
+	return shaders;
+}
+
+MShaderInstance* getShader( MObject object, RenderStyle style, bool componentMode, bool isSelected )
+{
+	switch( style )
+		{
+		case RenderStyle::BoundingBox :
+		case RenderStyle::Wireframe :
+		{
+			if( componentMode )
+			{
+				SelectionStateShaders shaders = getComponentWireShaders();
+				return isSelected ? shaders.selected : shaders.unselected;
+			}
+			else
+			{
+				SelectionStateShaders shaders = getWireShaders();
+				return isSelected ? shaders.selected : shaders.unselected;
+			}
+		}
+		case RenderStyle::Solid :
+		case RenderStyle::Textured :
+			{
+				TextureStateShaders shaders = getAssignedSurfaceShaders( object );
+				return style == RenderStyle::Solid ? shaders.untextured : shaders.textured;
+			}
+		default :
+			return nullptr;
+		}
+}
+
+bool componentsSelectable( const MDagPath &path )
+{
+	MHWRender::DisplayStatus displayStatus = MHWRender::MGeometryUtilities::displayStatus( path );
+	bool selectable = displayStatus == MHWRender::kHilite;
+	return selectable;
+}
+
+// Convenience function that should eventually help with also rendering all instances generated by instancers.
+// Currently not in use, but will come in handy when we get to look into MASH support.
+MObjectArray getConnectedInstancers( MObject object )
+{
+	MObjectArray result;
+
+	MStatus status;
+	MObject current;
+
+	MDagPathArray paths;
+	MMatrixArray matrices;
+	MIntArray pathStartIndices;
+	MIntArray pathIndices;
+
+	MItDependencyNodes it( MFn::kInstancer );
+	for( ; !it.isDone(); it.next() )
+	{
+		MObject currentInstancer = it.item();
+		MFnInstancer instFn( currentInstancer );
+
+		MStatus status;
+		MPlug inputsPlug = instFn.findPlug( "inputHierarchy", &status );
+		if( !status )
+		{
+			continue;
+		}
+
+		// We will need to figure out if our SceneShape feeds into this instancer.
+		for( unsigned int i = 0; i < inputsPlug.numElements(); ++i )
+		{
+			MPlug element = inputsPlug.elementByLogicalIndex( i );
+			MPlugArray srcPlugs;
+			element.connectedTo( srcPlugs, true, false );
+
+			bool found = false;
+			for(unsigned int i=0; i < srcPlugs.length(); ++i)
+			{
+				MFnDagNode connectedNode(srcPlugs[i].node());
+				if( connectedNode.object() == object || connectedNode.hasChild( object ) )
+				{
+					result.append( currentInstancer );
+					found = true;
+					break;
+				}
+			}
+
+			if( found )
+			{
+				break;
+			}
+		}
+	}
+
+	return result;
+}
+
+Imath::M44d worldTransform( const IECoreScene::SceneInterface *scene, double time )
+{
+	IECoreScene::SceneInterface::Path p;
+	scene->path( p );
+
+	IECoreScene::ConstSceneInterfacePtr tmpScene = scene->scene( IECoreScene::SceneInterface::rootPath );
+	Imath::M44d result;
+
+	for ( IECoreScene::SceneInterface::Path::const_iterator it = p.begin(); tmpScene && it != p.end(); ++it )
+		{
+			tmpScene = tmpScene->child( *it, IECoreScene::SceneInterface::NullIfMissing );
+			if ( !tmpScene )
+				{
+					break;
+				}
+
+			result = tmpScene->readTransformAsMatrix( time ) * result;
+		}
+
+	return result;
+}
+
+bool sceneIsAnimated( ConstSceneInterfacePtr sceneInterface )
+{
+	ConstSampledSceneInterfacePtr scene = IECore::runTimeCast< const SampledSceneInterface >( sceneInterface );
+	return ( !scene || scene->numBoundSamples() > 1 );
+}
+
+// std::map<const std::string, std::pair<MHWRender::MRenderItem*, MMatrixArray> > m_renderItems;
+
+void appendMatrixToRenderItem( RenderItemMap &renderItems, const std::string &name, MRenderItem *renderItem, MMatrix instanceMatrix )
+{
+	auto it = renderItems.find( name );
+	if( it == renderItems.end() )
+		{
+			MMatrixArray array = MMatrixArray();
+			it = renderItems.emplace( name, std::make_pair( renderItem, array ) ).first;
+		}
+
+	it->second.second.append( instanceMatrix );
+}
+
+
 } // namespace
 
 MString& SceneShapeSubSceneOverride::drawDbClassification()
@@ -929,7 +1269,7 @@ SceneShapeSubSceneOverride::~SceneShapeSubSceneOverride()
 bool SceneShapeSubSceneOverride::requiresUpdate(const MSubSceneContainer& container, const MFrameContext& frameContext) const
 {
 	// TIME UPDATED?
-	if( m_sceneShape->time() != m_time && sceneIsAnimated() )
+	if( m_sceneShape->time() != m_time && sceneIsAnimated( m_sceneInterface ) )
 	{
 		return true;
 	}
@@ -1064,17 +1404,17 @@ void SceneShapeSubSceneOverride::update( MSubSceneContainer& container, const MF
 	}
 
 	// Perform update
-	m_renderItems.clear();
-	m_itemToPathMap.clear();
-
+	m_renderItemNameToDagPath.clear();
 	container.clear(); // Clear out previous render items so that they don't interfere with new ones.
 
-	visitSceneLocations( m_sceneInterface, container, Imath::M44d(), /* isRoot = */ true );
+	// Store MRenderItems to be added while walking the tree.
+	RenderItemMap renderItems;
+	visitSceneLocations( m_sceneInterface, renderItems, container, Imath::M44d(), /* isRoot = */ true );
 
 	container.clear(); // MRenderItems might have been added temporarily so that Maya lets us fill them
 
 	// Actually add all gathered MRenderItems while using instancing where possible
-	for( auto namedRenderItem : m_renderItems )
+	for( auto namedRenderItem : renderItems )
 	{
 		auto itemAndMatrices = namedRenderItem.second;
 		MRenderItem *renderItem = itemAndMatrices.first;
@@ -1108,8 +1448,8 @@ void SceneShapeSubSceneOverride::update( MSubSceneContainer& container, const MF
 
 bool SceneShapeSubSceneOverride::getInstancedSelectionPath( const MRenderItem &renderItem, const MIntersection &intersection, MDagPath &dagPath ) const
 {
-	auto it = m_itemToPathMap.find( std::string( renderItem.name().asChar() ) );
-	if( it != m_itemToPathMap.end() )
+	auto it = m_renderItemNameToDagPath.find( std::string( renderItem.name().asChar() ) );
+	if( it != m_renderItemNameToDagPath.end() )
 	{
 		dagPath.set( it->second );
 		return true;
@@ -1139,7 +1479,7 @@ DrawAPI SceneShapeSubSceneOverride::supportedDrawAPIs() const
 }
 
 SceneShapeSubSceneOverride::SceneShapeSubSceneOverride( const MObject& obj )
-	: MPxSubSceneOverride( obj ), m_drawTagsFilter( "" ), m_time( -1 ), m_drawRootBounds( false ), m_shaderOutPlug(), m_materialIsDirty( true ), m_instancedRendering( false /* instancedRendering switch */ ), m_wireframeInstanceOverride( false )
+	: MPxSubSceneOverride( obj ), m_drawTagsFilter( "" ), m_time( -1 ), m_drawRootBounds( false ), m_shaderOutPlug(), m_materialIsDirty( true ), m_instancedRendering( false /* instancedRendering switch */ )
 {
 	MStatus status;
 	MFnDependencyNode node( obj, &status );
@@ -1150,29 +1490,7 @@ SceneShapeSubSceneOverride::SceneShapeSubSceneOverride( const MObject& obj )
 	}
 }
 
-Imath::M44d SceneShapeSubSceneOverride::worldTransform( const IECoreScene::SceneInterface *scene, double time ) const
-{
-	IECoreScene::SceneInterface::Path p;
-	scene->path( p );
-
-	IECoreScene::ConstSceneInterfacePtr tmpScene = scene->scene( IECoreScene::SceneInterface::rootPath );
-	Imath::M44d result;
-
-	for ( IECoreScene::SceneInterface::Path::const_iterator it = p.begin(); tmpScene && it != p.end(); ++it )
-	{
-		tmpScene = tmpScene->child( *it, IECoreScene::SceneInterface::NullIfMissing );
-		if ( !tmpScene )
-		{
-			break;
-		}
-
-		result = tmpScene->readTransformAsMatrix( time ) * result;
-	}
-
-	return result;
-}
-
-void SceneShapeSubSceneOverride::visitSceneLocations( ConstSceneInterfacePtr sceneInterface, MSubSceneContainer &container, const Imath::M44d &matrix, bool isRoot )
+void SceneShapeSubSceneOverride::visitSceneLocations( ConstSceneInterfacePtr sceneInterface, RenderItemMap &renderItems, MSubSceneContainer &container, const Imath::M44d &matrix, bool isRoot )
 {
 	if( !sceneInterface )
 	{
@@ -1189,7 +1507,7 @@ void SceneShapeSubSceneOverride::visitSceneLocations( ConstSceneInterfacePtr sce
 
 	for( const auto &childName : childNames )
 	{
-		visitSceneLocations( sceneInterface->child( childName ), container, accumulatedMatrix );
+		visitSceneLocations( sceneInterface->child( childName ), renderItems, container, accumulatedMatrix );
 	}
 
 	// Now handle current location.
@@ -1211,14 +1529,13 @@ void SceneShapeSubSceneOverride::visitSceneLocations( ConstSceneInterfacePtr sce
 		if( m_instancedRendering )
 		{
 			// \todo: All instances get the same shader - needs fixing, but we can't use this mode at the moment anyway.
-			MShaderInstance *shader = getShader( RenderStyle::BoundingBox, m_instances[0], name );
+			MShaderInstance *shader = getShader( m_sceneShape->thisMObject(), RenderStyle::BoundingBox, m_instances[0].componentMode, /* isSelected = */ false );
 
 			RenderItemWrapperCacheGetterKey key( this, rootItemName, IECore::NullObject::defaultNullObject(), RenderStyle::BoundingBox, container, shader, boundingBox, /* hashName = */ false );
 			RenderItemWrapperPtr renderItemWrapper = g_renderItemCache.get( key );
+			renderItemWrapper->get()->setShader( shader );
 
-			renderItemWrapper->renderItem()->setShader( shader );
-
-			MRenderItem *storageCopy = MRenderItem::Create( *(renderItemWrapper->renderItem()) );
+			MRenderItem *storageCopy = MRenderItem::Create( *(renderItemWrapper->get()) );
 			std::string name = storageCopy->name().asChar();
 
 			for( const auto &instance : m_instances )
@@ -1226,8 +1543,8 @@ void SceneShapeSubSceneOverride::visitSceneLocations( ConstSceneInterfacePtr sce
 				Imath::M44d instanceMatrix = accumulatedMatrix * instance.transformation;
 				MMatrix instanceMayaMatrix = IECore::convert<MMatrix, Imath::M44d>( instanceMatrix );
 
-				appendMatrixToRenderItem( name, storageCopy, instanceMayaMatrix );
-				m_itemToPathMap[storageCopy->name().asChar()] = instance.path;
+				appendMatrixToRenderItem( renderItems, name, storageCopy, instanceMayaMatrix );
+				m_renderItemNameToDagPath[storageCopy->name().asChar()] = instance.path;
 			}
 		}
 		else
@@ -1239,17 +1556,17 @@ void SceneShapeSubSceneOverride::visitSceneLocations( ConstSceneInterfacePtr sce
 				MMatrix instanceMayaMatrix = IECore::convert<MMatrix, Imath::M44d>( instanceMatrix );
 
 				std::string instanceName = rootItemName + "_" + std::to_string( count++ );
-				MShaderInstance *shader = getShader( RenderStyle::BoundingBox, instance, name );
+				MShaderInstance *shader = getShader( m_sceneShape->thisMObject(), RenderStyle::BoundingBox, instance.componentMode, /* isComponentSelected = */ false );
 
 				RenderItemWrapperCacheGetterKey key( this, instanceName, IECore::NullObject::defaultNullObject(), RenderStyle::BoundingBox, container, shader, boundingBox, /* hashName = */ true );
 				RenderItemWrapperPtr renderItemWrapper = g_renderItemCache.get( key );
 
-				renderItemWrapper->renderItem()->setShader( shader );
+				renderItemWrapper->get()->setShader( shader );
 
-				MRenderItem *storageCopy = MRenderItem::Create( *(renderItemWrapper->renderItem()) );
+				MRenderItem *storageCopy = MRenderItem::Create( *(renderItemWrapper->get()) );
 
-				appendMatrixToRenderItem( instanceName, storageCopy, instanceMayaMatrix );
-				m_itemToPathMap[storageCopy->name().asChar()] = instance.path;
+				appendMatrixToRenderItem( renderItems, instanceName, storageCopy, instanceMayaMatrix );
+				m_renderItemNameToDagPath[storageCopy->name().asChar()] = instance.path;
 			}
 		}
 	}
@@ -1287,6 +1604,7 @@ void SceneShapeSubSceneOverride::visitSceneLocations( ConstSceneInterfacePtr sce
 	Imath::Box3f bounds( Imath::V3f( boundingBoxD.min.x, boundingBoxD.min.y, boundingBoxD.min.z ), Imath::V3f( boundingBoxD.max.x, boundingBoxD.max.y, boundingBoxD.max.z ) );
 
 	int componentIndex = m_sceneShape->selectionIndex( name );
+	bool componentSelected = m_selectedComponents.count( componentIndex ) > 0;
 
 	// Adding RenderItems as needed
 	// ----------------------------
@@ -1325,16 +1643,18 @@ void SceneShapeSubSceneOverride::visitSceneLocations( ConstSceneInterfacePtr sce
 		if( m_instancedRendering )
 		{
 			// \todo: per-instance shading
-			MShaderInstance *shader = getShader( style, m_instances[0], name );
+			bool componentMode = m_instances[0].componentMode;
+			MShaderInstance *shader = getShader( m_sceneShape->thisMObject(), style, componentMode, componentMode ? componentSelected : m_instances[0].selected );
 
 			RenderItemWrapperCacheGetterKey key( this, name, object, style, container, shader, bounds, /* hashName = */ false );
 			RenderItemWrapperPtr renderItemWrapper = g_renderItemCache.get( key );
+			// \todo: mh.
 			if( !renderItemWrapper )
 			{
 				continue;
 			}
 
-			storageCopy = MRenderItem::Create( *(renderItemWrapper->renderItem()) );
+			storageCopy = MRenderItem::Create( *(renderItemWrapper->get()) );
 
 			std::string copyName = storageCopy->name().asChar();
 
@@ -1349,8 +1669,8 @@ void SceneShapeSubSceneOverride::visitSceneLocations( ConstSceneInterfacePtr sce
 				}
 
 				MMatrix instanceMatrix = IECore::convert<MMatrix, Imath::M44d>( accumulatedMatrix * instance.transformation );
-				appendMatrixToRenderItem( copyName, storageCopy, instanceMatrix );
-				m_itemToPathMap[copyName] = instance.path;
+				appendMatrixToRenderItem( renderItems, copyName, storageCopy, instanceMatrix );
+				m_renderItemNameToDagPath[copyName] = instance.path;
 			}
 
 			storageCopy->enable( true );
@@ -1370,7 +1690,7 @@ void SceneShapeSubSceneOverride::visitSceneLocations( ConstSceneInterfacePtr sce
 					}
 				}
 
-				MShaderInstance *shader = getShader( style, instance, name );
+				MShaderInstance *shader = getShader( m_sceneShape->thisMObject(), style, instance.componentMode, instance.componentMode ? componentSelected : instance.selected );
 
 				std::string instanceName = instanceBaseName + std::to_string( instanceIndex++ );
 				MMatrix instanceMatrix = IECore::convert<MMatrix, Imath::M44d>( accumulatedMatrix * instance.transformation );
@@ -1378,203 +1698,18 @@ void SceneShapeSubSceneOverride::visitSceneLocations( ConstSceneInterfacePtr sce
 				RenderItemWrapperCacheGetterKey key( this, instanceName, object, style, container, shader, bounds, /* hashName = */ true );
 				RenderItemWrapperPtr renderItemWrapper = g_renderItemCache.get( key );
 
-				storageCopy = MRenderItem::Create( *(renderItemWrapper->renderItem()) );
+				storageCopy = MRenderItem::Create( *(renderItemWrapper->get()) );
 				storageCopy->enable( true );
 				storageCopy->setShader( shader ); // potentially updating an old shader for a cached render item
 
 				storageCopy->setCustomData( new RenderItemUserData( componentIndex ) );
 				MDrawRegistry::registerComponentConverter( storageCopy->name(), ComponentConverter::creator );
 
-				appendMatrixToRenderItem( instanceName, storageCopy, instanceMatrix ); // using unique name
-				m_itemToPathMap[storageCopy->name().asChar()] = instance.path;
+				appendMatrixToRenderItem( renderItems, instanceName, storageCopy, instanceMatrix ); // using unique name
+				m_renderItemNameToDagPath[storageCopy->name().asChar()] = instance.path;
 			}
 		}
 	}
-}
-
-SceneShapeSubSceneOverride::ShaderPair SceneShapeSubSceneOverride::getWireShaders() const
-{
-	static ShaderPair shaders = std::make_pair( nullptr, nullptr );
-
-	if( !shaders.first || !shaders.second )
-	{
-		MRenderer* renderer = MRenderer::theRenderer();
-		if( !renderer )
-		{
-			return shaders;
-		}
-
-		const MShaderManager* shaderManager = renderer->getShaderManager();
-		if( !shaderManager )
-		{
-			return shaders;
-		}
-
-		MShaderInstance *shader = shaderManager->getStockShader( MShaderManager::k3dSolidShader );
-		MShaderInstance *shaderSelected = shader->clone();
-
-		MDoubleArray a, b;
-		MGlobal::executeCommand( "colorIndex -q 19", a );
-		MGlobal::executeCommand( "colorIndex -q 5", b );
-
-		const float highlightedWireColor[] = {(float)a[0], (float)a[1], (float)a[2], 1.0f};
-		const float unhighlightedWireColor[] = {(float)b[0], (float)b[1], (float)b[2], 1.0f};
-
-		shader->setParameter("solidColor", unhighlightedWireColor );
-		shaderSelected->setParameter("solidColor", highlightedWireColor );
-
-		shaders = std::make_pair( shader, shaderSelected );
-	}
-
-	return shaders;
-}
-
-SceneShapeSubSceneOverride::ShaderPair SceneShapeSubSceneOverride::getComponentWireShaders() const
-{
-	static ShaderPair shaders = std::make_pair( nullptr, nullptr );
-
-	if( !shaders.first || !shaders.second )
-	{
-		MRenderer* renderer = MRenderer::theRenderer();
-		if( !renderer )
-		{
-			return shaders;
-		}
-
-		const MShaderManager* shaderManager = renderer->getShaderManager();
-		if( !shaderManager )
-		{
-			return shaders;
-		}
-
-		MDoubleArray a, b;
-		MGlobal::executeCommand( "colorIndex -q 21", a );
-		MGlobal::executeCommand( "colorIndex -q 18", b );
-
-		const float highlightedWireColor[] = {(float)a[0], (float)a[1], (float)a[2], 1.0f};
-		const float unhighlightedWireColor[] = {(float)b[0], (float)b[1], (float)b[2], 1.0f};
-
-		MShaderInstance *shader = shaderManager->getStockShader( MShaderManager::k3dSolidShader );
-		MShaderInstance *shaderSelected = shader->clone();
-
-		shader->setParameter("solidColor", unhighlightedWireColor );
-		shaderSelected->setParameter("solidColor", highlightedWireColor );
-
-		shaders = std::make_pair( shader, shaderSelected );
-	}
-
-	return shaders;
-}
-
-
-SceneShapeSubSceneOverride::ShaderPair SceneShapeSubSceneOverride::getAssignedSurfaceShaders()
-{
-	ShaderPair shaders = std::make_pair( nullptr, nullptr );
-
-	if( !shaders.first || !shaders.second || m_materialIsDirty )
-	{
-		MRenderer* renderer = MRenderer::theRenderer();
-		if( !renderer )
-		{
-			return shaders;
-		}
-
-		const MShaderManager* shaderManager = renderer->getShaderManager();
-		if( !shaderManager )
-		{
-			return shaders;
-		}
-
-		MFnDagNode node( m_sceneShape->thisMObject() );
-		MDagPathArray instances;
-		node.getAllPaths(instances);
-
-		if( !m_shaderOutPlug.isNull() )
-		{
-			MShaderInstance *gray = shaderManager->getShaderFromNode( m_shaderOutPlug.node(), instances[0], 0, 0, 0, 0, /* nonTextured = */ true );
-			MShaderInstance *textured = shaderManager->getShaderFromNode( m_shaderOutPlug.node(), instances[0], 0, 0, 0, 0, /* nonTextured = */ false );
-			shaders = std::make_pair( gray, textured );
-		}
-		else
-		{
-			MShaderInstance *stockDefault = shaderManager->getStockShader( MShaderManager::MStockShader::k3dDefaultMaterialShader );
-			shaders = std::make_pair( stockDefault, stockDefault );
-		}
-
-		m_materialIsDirty = false;
-	}
-
-	return shaders;
-}
-
-// Convenience function that should eventually help with also rendering all instances generated by instancers.
-// Currently not in use, but will come in handy when we get to look into MASH support.
-MObjectArray SceneShapeSubSceneOverride::getConnectedInstancers() const
-{
-	MObjectArray result;
-
-	MStatus status;
-	MObject current;
-
-	MDagPathArray paths;
-	MMatrixArray matrices;
-	MIntArray pathStartIndices;
-	MIntArray pathIndices;
-
-	MObject sceneShape = m_sceneShape->thisMObject();
-
-	MItDependencyNodes it( MFn::kInstancer );
-	for( ; !it.isDone(); it.next() )
-	{
-		MObject currentInstancer = it.item();
-		MFnInstancer instFn( currentInstancer );
-
-		MStatus status;
-		MPlug inputsPlug = instFn.findPlug( "inputHierarchy", &status );
-		if( !status )
-		{
-			continue;
-		}
-
-		// We will need to figure out if our SceneShape feeds into this instancer.
-		for( unsigned int i = 0; i < inputsPlug.numElements(); ++i )
-		{
-			MPlug element = inputsPlug.elementByLogicalIndex( i );
-			MPlugArray srcPlugs;
-			element.connectedTo( srcPlugs, true, false );
-
-			bool found = false;
-			for(unsigned int i=0; i < srcPlugs.length(); ++i)
-			{
-				MFnDagNode connectedNode(srcPlugs[i].node());
-				if( connectedNode.object() == sceneShape || connectedNode.hasChild( sceneShape ) )
-				{
-					result.append( currentInstancer );
-					found = true;
-					break;
-				}
-			}
-
-			if( found )
-			{
-				break;
-			}
-		}
-	}
-
-	return result;
-}
-
-void SceneShapeSubSceneOverride::appendMatrixToRenderItem( const std::string &name, MRenderItem *renderItem, MMatrix instanceMatrix )
-{
-	auto it = m_renderItems.find( name );
-	if( it == m_renderItems.end() )
-	{
-		MMatrixArray array = MMatrixArray();
-		it = m_renderItems.emplace( name, std::make_pair( renderItem, array ) ).first;
-	}
-
-	it->second.second.append( instanceMatrix );
 }
 
 void SceneShapeSubSceneOverride::selectedComponentIndices( std::set<int> &indices ) const
@@ -1612,12 +1747,6 @@ void SceneShapeSubSceneOverride::selectedComponentIndices( std::set<int> &indice
 	}
 }
 
-bool SceneShapeSubSceneOverride::sceneIsAnimated() const
-{
-	ConstSampledSceneInterfacePtr scene = IECore::runTimeCast< const SampledSceneInterface >( m_sceneInterface );
-	return ( !scene || scene->numBoundSamples() > 1 );
-}
-
 void SceneShapeSubSceneOverride::gatherInstanceInformation( Instances &instances, bool globalWireframeDrawing ) const
 {
 	MSelectionList selectionList;
@@ -1631,7 +1760,6 @@ void SceneShapeSubSceneOverride::gatherInstanceInformation( Instances &instances
 	instances.reserve( numInstances );
 	for( int pathIndex = 0; pathIndex < numInstances; ++pathIndex )
 	{
-
 		MDagPath& path = dagPaths[pathIndex];
 		Imath::M44d matrix = IECore::convert<Imath::M44d, MMatrix>( path.inclusiveMatrix() );
 		bool pathSelected = isPathSelected( selectionList, path );
@@ -1703,52 +1831,3 @@ bool SceneShapeSubSceneOverride::renderAllShaded( unsigned int displayStyle ) co
 	return false;
 }
 
-MShaderInstance* SceneShapeSubSceneOverride::getShader( RenderStyle style, const Instance &instance, const std::string &location )
-{
-	switch( style )
-	{
-		case RenderStyle::BoundingBox :
-		case RenderStyle::Wireframe :
-		{
-			// \todo: per-instance component shaders
-			int componentIndex = m_sceneShape->selectionIndex( location );
-			bool componentSelected = m_selectedComponents.count( componentIndex ) > 0;
-
-			if( instance.componentMode || componentSelected )
-			{
-				ShaderPair shaders = getComponentWireShaders();
-				return componentSelected ? shaders.second : shaders.first;
-			}
-			else
-			{
-				ShaderPair shaders = getWireShaders();
-				return instance.selected ? shaders.second : shaders.first;
-			}
-		}
-		case RenderStyle::Solid :
-		case RenderStyle::Textured :
-		{
-			ShaderPair shaders = getAssignedSurfaceShaders();
-			return style == RenderStyle::Solid ? shaders.first : shaders.second;
-		}
-		default :
-			return nullptr;
-	}
-}
-
-bool SceneShapeSubSceneOverride::componentsSelectable( const MDagPath &path ) const
-{
-	MHWRender::DisplayStatus displayStatus = MHWRender::MGeometryUtilities::displayStatus( path );
-	bool selectable = displayStatus == MHWRender::kHilite;
-	return selectable;
-}
-
-RenderItemWrapper::RenderItemWrapper( MRenderItem *renderItem, GeometryDataPtr geometryData )
-	: m_renderItem( renderItem ), m_geometryData( geometryData )
-{
-}
-
-RenderItemWrapper::~RenderItemWrapper()
-{
-	MRenderItem::Destroy( m_renderItem );
-}
