@@ -59,6 +59,7 @@ namespace IECoreMaya
 
 enum class RenderStyle { BoundingBox, Wireframe, Solid, Textured, Last };
 
+using IndexMap = std::map<const std::string, std::set<int> >;
 using RenderItemMap = std::map<const std::string, std::pair<MHWRender::MRenderItem*, MMatrixArray> >;
 
 class IECOREMAYA_API SceneShapeSubSceneOverride : public MHWRender::MPxSubSceneOverride
@@ -126,11 +127,6 @@ class IECOREMAYA_API SceneShapeSubSceneOverride : public MHWRender::MPxSubSceneO
 		bool renderAllWireframes( unsigned int displayStyle ) const;
 		bool renderAllShaded( unsigned int displayStyle ) const;
 
-		// Get all component indices that are currently selected. Useful for
-		// determining both selection changes and rendering states of these
-		// components.
-		void selectedComponentIndices( std::set<int> &selectedComponents ) const;
-
 		SceneShape *m_sceneShape;
 
 		std::string m_drawTagsFilter;
@@ -147,7 +143,7 @@ class IECOREMAYA_API SceneShapeSubSceneOverride : public MHWRender::MPxSubSceneO
 		IECoreScene::ConstSceneInterfacePtr m_sceneInterface;
 
 		std::map<const std::string, MDagPath> m_renderItemNameToDagPath;
-		std::set<int> m_selectedComponents;
+		IndexMap m_selectedComponents;
 };
 
 } // namespace IECoreMaya

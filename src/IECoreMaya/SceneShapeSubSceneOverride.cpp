@@ -53,6 +53,7 @@
 
 #include "OpenEXR/ImathVec.h"
 
+#include "IECore/Timer.h"
 #include "IECore/Exception.h"
 #include "IECore/Object.h"
 #include "IECore/MessageHandler.h"
@@ -916,7 +917,7 @@ using RenderItemCache = IECore::LRUCache<IECore::MurmurHash, RenderItemWrapperPt
 RenderItemCache g_renderItemCache(renderItemGetter, 10000);
 
 // For the given node return the out plug on the surface shader that is assigned
-MPlug getShaderOutPlug( MObject sceneShapeNode )
+MPlug getShaderOutPlug( const MObject &sceneShapeNode )
 {
 	MPlug result = MPlug();
 
@@ -1066,7 +1067,7 @@ SelectionStateShaders getComponentWireShaders()
 	return shaders;
 }
 
-TextureStateShaders getAssignedSurfaceShaders( MObject object )
+TextureStateShaders getAssignedSurfaceShaders( const MObject &object )
 {
 	TextureStateShaders shaders( nullptr, nullptr );
 
@@ -1108,7 +1109,7 @@ TextureStateShaders getAssignedSurfaceShaders( MObject object )
 	return shaders;
 }
 
-MShaderInstance* getShader( MObject object, RenderStyle style, bool componentMode, bool isSelected )
+MShaderInstance* getShader( const MObject &object, RenderStyle style, bool componentMode, bool isSelected )
 {
 	switch( style )
 		{
@@ -1209,15 +1210,15 @@ Imath::M44d worldTransform( const IECoreScene::SceneInterface *scene, double tim
 	Imath::M44d result;
 
 	for ( IECoreScene::SceneInterface::Path::const_iterator it = p.begin(); tmpScene && it != p.end(); ++it )
+	{
+		tmpScene = tmpScene->child( *it, IECoreScene::SceneInterface::NullIfMissing );
+		if ( !tmpScene )
 		{
-			tmpScene = tmpScene->child( *it, IECoreScene::SceneInterface::NullIfMissing );
-			if ( !tmpScene )
-				{
-					break;
-				}
-
-			result = tmpScene->readTransformAsMatrix( time ) * result;
+			break;
 		}
+
+		result = tmpScene->readTransformAsMatrix( time ) * result;
+	}
 
 	return result;
 }
@@ -1227,8 +1228,6 @@ bool sceneIsAnimated( ConstSceneInterfacePtr sceneInterface )
 	ConstSampledSceneInterfacePtr scene = IECore::runTimeCast< const SampledSceneInterface >( sceneInterface );
 	return ( !scene || scene->numBoundSamples() > 1 );
 }
-
-// std::map<const std::string, std::pair<MHWRender::MRenderItem*, MMatrixArray> > m_renderItems;
 
 void appendMatrixToRenderItem( RenderItemMap &renderItems, const std::string &name, MRenderItem *renderItem, MMatrix instanceMatrix )
 {
@@ -1242,6 +1241,57 @@ void appendMatrixToRenderItem( RenderItemMap &renderItems, const std::string &na
 	it->second.second.append( instanceMatrix );
 }
 
+void selectedComponentIndices( const MObject &object, IndexMap &indexMap )
+{
+	// IECore::ScopedTimer foo( "selectedComponentIndices" );
+
+	// printf( "called\n" );
+	MStatus s;
+
+	MSelectionList selectionList;
+	MGlobal::getActiveSelectionList( selectionList );
+	MItSelectionList selectionIter( selectionList );
+
+	// printf( "length: %i\n", (int)selectionList.length() );
+
+	MFnDagNode dagNode( object );
+	MDagPathArray dagPaths;
+	dagNode.getAllPaths(dagPaths);
+
+	// Initialize map with empty sets
+	for( int i = 0; i < (int)dagPaths.length(); ++i )
+	{
+		std::string keyPath = dagPaths[i].fullPathName().asChar();
+		indexMap[keyPath] = std::set<int>();
+	}
+
+	for( ; !selectionIter.isDone(); selectionIter.next() )
+	{
+		MDagPath selectedPath; // path to shape
+		MObject comp;
+		selectionIter.getDagPath( selectedPath, comp );
+
+		if( comp.isNull() )
+		{
+			continue;
+		}
+
+		MFnSingleIndexedComponent compFn( comp, &s );
+		if( !s )
+		{
+			continue;
+		}
+
+		MIntArray componentIndices;
+		compFn.getElements( componentIndices );
+
+		std::string key = selectedPath.fullPathName().asChar();
+		for( unsigned int i = 0; i < componentIndices.length(); ++i )
+		{
+			indexMap[key].insert( componentIndices[i] );
+		}
+	}
+}
 
 } // namespace
 
@@ -1268,6 +1318,8 @@ SceneShapeSubSceneOverride::~SceneShapeSubSceneOverride()
 
 bool SceneShapeSubSceneOverride::requiresUpdate(const MSubSceneContainer& container, const MFrameContext& frameContext) const
 {
+	IECore::ScopedTimer foo( "reqUpdate" );
+
 	// TIME UPDATED?
 	if( m_sceneShape->time() != m_time && sceneIsAnimated( m_sceneInterface ) )
 	{
@@ -1282,10 +1334,9 @@ bool SceneShapeSubSceneOverride::requiresUpdate(const MSubSceneContainer& contai
 
 	// DRAW GEOMETRY SETTINGS UPDATED?
 	const unsigned int displayStyle = frameContext.getDisplayStyle();
-
-	bool renderBounds( renderAllBounds( displayStyle ) );
-	bool renderWireframes( renderAllWireframes( displayStyle ) );
-	bool renderShaded( renderAllShaded( displayStyle ) );
+	bool renderBounds = renderAllBounds( displayStyle );
+	bool renderWireframes = renderAllWireframes( displayStyle );
+	bool renderShaded = renderAllShaded( displayStyle );
 
 	// Determine if display settings need to trigger update
 	if( renderBounds != m_styleMask.test( (int)RenderStyle::BoundingBox ) )
@@ -1321,9 +1372,10 @@ bool SceneShapeSubSceneOverride::requiresUpdate(const MSubSceneContainer& contai
 		return true;
 	}
 
+	// \todo: This should scale better. It's depending on both the selection and the instances at the moment.
 	// COMPONENT SELECTION UPDATED?
-	std::set<int> selectedComponents;
-	selectedComponentIndices( selectedComponents );
+	IndexMap selectedComponents;
+	selectedComponentIndices( m_sceneShape->thisMObject(), selectedComponents );
 	if( selectedComponents != m_selectedComponents )
 	{
 		return true;
@@ -1389,7 +1441,7 @@ void SceneShapeSubSceneOverride::update( MSubSceneContainer& container, const MF
 
 	// COMPONENT SELECTION
 	m_selectedComponents.clear();
-	selectedComponentIndices( m_selectedComponents );
+	selectedComponentIndices( m_sceneShape->thisMObject(), m_selectedComponents );
 
 	// INSTANCES - sort out transformation and selection
 	m_instances.clear();
@@ -1424,6 +1476,7 @@ void SceneShapeSubSceneOverride::update( MSubSceneContainer& container, const MF
 			continue;
 		}
 
+		// \todo
 		container.add( renderItem );
 
 		// note: the following is true for all entries if
@@ -1604,7 +1657,6 @@ void SceneShapeSubSceneOverride::visitSceneLocations( ConstSceneInterfacePtr sce
 	Imath::Box3f bounds( Imath::V3f( boundingBoxD.min.x, boundingBoxD.min.y, boundingBoxD.min.z ), Imath::V3f( boundingBoxD.max.x, boundingBoxD.max.y, boundingBoxD.max.z ) );
 
 	int componentIndex = m_sceneShape->selectionIndex( name );
-	bool componentSelected = m_selectedComponents.count( componentIndex ) > 0;
 
 	// Adding RenderItems as needed
 	// ----------------------------
@@ -1644,6 +1696,8 @@ void SceneShapeSubSceneOverride::visitSceneLocations( ConstSceneInterfacePtr sce
 		{
 			// \todo: per-instance shading
 			bool componentMode = m_instances[0].componentMode;
+			std::string pathKey = m_instances[0].path.fullPathName().asChar();
+			bool componentSelected = m_selectedComponents[pathKey].count( componentIndex ) > 0;
 			MShaderInstance *shader = getShader( m_sceneShape->thisMObject(), style, componentMode, componentMode ? componentSelected : m_instances[0].selected );
 
 			RenderItemWrapperCacheGetterKey key( this, name, object, style, container, shader, bounds, /* hashName = */ false );
@@ -1690,6 +1744,8 @@ void SceneShapeSubSceneOverride::visitSceneLocations( ConstSceneInterfacePtr sce
 					}
 				}
 
+				std::string pathKey = instance.path.fullPathName().asChar();
+				bool componentSelected = m_selectedComponents[pathKey].count( componentIndex ) > 0;
 				MShaderInstance *shader = getShader( m_sceneShape->thisMObject(), style, instance.componentMode, instance.componentMode ? componentSelected : instance.selected );
 
 				std::string instanceName = instanceBaseName + std::to_string( instanceIndex++ );
@@ -1708,41 +1764,6 @@ void SceneShapeSubSceneOverride::visitSceneLocations( ConstSceneInterfacePtr sce
 				appendMatrixToRenderItem( renderItems, instanceName, storageCopy, instanceMatrix ); // using unique name
 				m_renderItemNameToDagPath[storageCopy->name().asChar()] = instance.path;
 			}
-		}
-	}
-}
-
-void SceneShapeSubSceneOverride::selectedComponentIndices( std::set<int> &indices ) const
-{
-	MStatus s;
-
-	MSelectionList selectionList;
-	MGlobal::getActiveSelectionList( selectionList );
-	MItSelectionList iter( selectionList );
-
-	for( ; !iter.isDone(); iter.next() )
-	{
-		MDagPath path;
-		MObject comp;
-		iter.getDagPath( path, comp );
-
-		if( comp.isNull() )
-		{
-			continue;
-		}
-
-		MFnSingleIndexedComponent compFn( comp, &s );
-		if( !s )
-		{
-			continue;
-		}
-
-		MIntArray componentIndices;
-		compFn.getElements( componentIndices );
-
-		for( unsigned int i = 0; i < componentIndices.length(); ++i )
-		{
-			indices.insert( componentIndices[i] );
 		}
 	}
 }
