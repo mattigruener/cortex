@@ -85,7 +85,7 @@ struct GeometryData
 {
 	public :
 		GeometryData()
-			: vertexBufferArray( new MHWRender::MVertexBufferArray )
+			: vertexBufferArray( new MHWRender::MVertexBufferArray ) // , dataView( nullptr )
 		{
 		}
 
@@ -110,6 +110,10 @@ struct GeometryData
 		VertexBufferArrayPtr vertexBufferArray;
 		IndexBufferPtr indexBuffer;
 		IndexBufferPtr wireframeIndexBuffer;
+
+		// \todo: this is a test
+		// NOTE: We don't own this render item.
+		MRenderItem *dataView;
 };
 
 using GeometryDataPtr = std::shared_ptr<GeometryData>;
@@ -146,9 +150,25 @@ using GeometryDataPtr = std::shared_ptr<GeometryData>;
 
 // IE_CORE_DECLAREPTR( RenderItemWrapper );
 
+// Data stored per MRenderItem. We make sure that we only have a single instance
+// for equivalent data as Maya is taking the user data into account when making
+// consolidation decisions.
 class RenderItemUserData : public MUserData
 {
 	public :
+
+		static RenderItemUserData* create( int componentIndex )
+		{
+			const auto &entry = RenderItemUserData::s_map.find( componentIndex );
+			if( entry != RenderItemUserData::s_map.end() )
+			{
+				return entry->second;
+			}
+
+			RenderItemUserData *data = new RenderItemUserData( componentIndex );
+			RenderItemUserData::s_map.emplace( componentIndex, data );
+			return data;
+		}
 
 		RenderItemUserData( int componentIndex )
 			: MUserData( true ),  // delete when render item is deleted
@@ -161,7 +181,14 @@ class RenderItemUserData : public MUserData
 		}
 
 		int componentIndex;
+
+	private :
+
+	  static std::map<int, RenderItemUserData*> s_map;
+
 };
+
+std::map<int, RenderItemUserData*> RenderItemUserData::s_map;
 
 // As we render a render item per component, all we need to know here is the
 // component index per render item.
@@ -273,10 +300,18 @@ struct BoundDataCacheGetterKey
 
 struct GeometryDataCacheGetterKey
 {
-	GeometryDataCacheGetterKey( const IECoreScene::ConstPrimitivePtr primitive, const MVertexBufferDescriptorList &descriptorList )
-		:	m_primitive( primitive ), m_descriptorList( descriptorList )
+	GeometryDataCacheGetterKey( const IECore::ConstObjectPtr object, const MVertexBufferDescriptorList &descriptorList, const Imath::Box3f &bounds )
+		:	object( object ), descriptorList( descriptorList ), bounds( bounds )
 	{
-		m_primitive->hash( m_hash );
+		if( object )
+		{
+			object->hash( m_hash );
+		}
+		else
+		{
+			m_hash.append( bounds );
+		}
+
 	}
 
 	operator const IECore::MurmurHash & () const
@@ -284,50 +319,12 @@ struct GeometryDataCacheGetterKey
 		return m_hash;
 	}
 
-	const IECoreScene::ConstPrimitivePtr m_primitive;
-	const MVertexBufferDescriptorList &m_descriptorList;
+	const IECore::ConstObjectPtr object;
+	const MVertexBufferDescriptorList &descriptorList;
+	const Imath::Box3f &bounds;
+
 	IECore::MurmurHash m_hash;
 };
-
-// struct RenderItemWrapperCacheGetterKey
-// {
-// 	RenderItemWrapperCacheGetterKey( SceneShapeSubSceneOverride *sceneShape,
-// 									 const std::string &name,
-// 									 ConstObjectPtr object,
-// 									 const RenderStyle style,
-// 									 MSubSceneContainer &container,
-// 									 MShaderInstance *shader,
-// 									 const Imath::Box3f boundingBox,
-// 									 bool hashName = true)
-// 		:	m_object( object ), m_name( name ), m_style( style ), m_sceneShape( sceneShape ), m_container( container ), m_shader( shader ), m_boundingBox( boundingBox )
-// 	{
-// 		m_object->hash( m_hash );
-// 		m_hash.append( (int)m_style );
-// 		m_hash.append( boundingBox );
-
-// 		if( hashName )
-// 		{
-// 			m_hash.append( name );
-// 		}
-// 	}
-
-// 	operator const IECore::MurmurHash & () const
-// 	{
-// 		return m_hash;
-// 	}
-
-// 	// most of these members aren't needed to compute the hash, but to then
-// 	// construct an MRenderItem
-// 	ConstObjectPtr m_object;
-// 	const std::string m_name;
-// 	const RenderStyle m_style;
-// 	SceneShapeSubSceneOverride *m_sceneShape;
-// 	MSubSceneContainer &m_container;
-// 	MShaderInstance *m_shader;
-// 	const Imath::Box3f m_boundingBox;
-
-// 	IECore::MurmurHash m_hash;
-// };
 
 void ensureFaceVaryingData( IECore::ConstIntVectorDataPtr &i, IECore::ConstV3fVectorDataPtr &p, IECore::ConstV3fVectorDataPtr &n, std::vector<int> &additionalIndices, bool interpolationIsLinear )
 {
@@ -382,7 +379,8 @@ void ensureFaceVaryingData( IECore::ConstIntVectorDataPtr &i, IECore::ConstV3fVe
 	n = newNormals;
 }
 
-void fillBoundData( const Imath::Box3f &bounds, GeometryDataPtr boundingBoxData )
+// Returns size of data stored in geometryData
+size_t fillBoundData( const Imath::Box3f &bounds, GeometryDataPtr boundingBoxData )
 {
 	MVertexBufferDescriptor positionDescriptor( "", MGeometry::kPosition, MGeometry::kFloat, 3 );
 	MVertexBuffer *positionBuffer = new MVertexBuffer( positionDescriptor );
@@ -448,11 +446,15 @@ void fillBoundData( const Imath::Box3f &bounds, GeometryDataPtr boundingBoxData 
 
 		boundingBoxData->wireframeIndexBuffer->commit( indexData );
 	}
+
+	return 1; // \todo: determine cost properly
 }
 
-void fillPointsData( ConstPrimitivePtr primitive, GeometryDataPtr geometryData )
+// Returns size of data stored in geometryData
+size_t fillPointsData( ConstObjectPtr object, GeometryDataPtr geometryData )
 {
-	IECoreScene::ConstPointsPrimitivePtr pointsPrimitive = IECore::runTimeCast<const IECoreScene::PointsPrimitive>( primitive );
+	IECoreScene::ConstPointsPrimitivePtr pointsPrimitive = IECore::runTimeCast<const IECoreScene::PointsPrimitive>( object );
+	assert( pointsPrimitive );
 
 	IECore::ConstV3fVectorDataPtr p = pointsPrimitive->variableData<IECore::V3fVectorData>( "P" );
 	const std::vector<Imath::V3f> &positionsReadable = p->readable();
@@ -474,13 +476,19 @@ void fillPointsData( ConstPrimitivePtr primitive, GeometryDataPtr geometryData )
 	// these can be empty for simple points data, but they have to exist.
 	geometryData->indexBuffer.reset( new MIndexBuffer(MGeometry::kUnsignedInt32) );
 	geometryData->wireframeIndexBuffer.reset( new MIndexBuffer(MGeometry::kUnsignedInt32) );
+
+	return 1; // \todo: determine cost properly
 }
 
-void fillCurvesData( ConstPrimitivePtr primitive, GeometryDataPtr geometryData )
+// Returns size of data stored in geometryData
+size_t fillCurvesData( ConstObjectPtr object, GeometryDataPtr geometryData )
 {
 	// \todo: currently a curve is built from linear segments. Needs proper interpolation at some point.
-
-	IECoreScene::ConstCurvesPrimitivePtr curvesPrimitive = IECore::runTimeCast<const IECoreScene::CurvesPrimitive>( primitive );
+	IECoreScene::ConstCurvesPrimitivePtr curvesPrimitive = IECore::runTimeCast<const IECoreScene::CurvesPrimitive>( object );
+	if( !curvesPrimitive )
+	{
+		return 0;
+	}
 
 	// provide positions
 	IECore::ConstV3fVectorDataPtr p = curvesPrimitive->variableData<IECore::V3fVectorData>( "P" );
@@ -534,11 +542,18 @@ void fillCurvesData( ConstPrimitivePtr primitive, GeometryDataPtr geometryData )
 	// use the same buffer for both wireframe and shaded rendering
 	geometryData->wireframeIndexBuffer->commit( wireframeIndexData );
 	geometryData->indexBuffer.reset( geometryData->wireframeIndexBuffer.get() );
+
+	return 1; // \todo: determine cost properly
 }
 
-void fillMeshData( ConstPrimitivePtr primitive, const MVertexBufferDescriptorList &descriptorList, GeometryDataPtr geometryData )
+// Returns size of data stored in geometryData
+size_t fillMeshData( ConstObjectPtr object, const MVertexBufferDescriptorList &descriptorList, GeometryDataPtr geometryData )
 {
-	IECoreScene::ConstMeshPrimitivePtr meshPrimitive = IECore::runTimeCast<const IECoreScene::MeshPrimitive>( primitive );
+	IECoreScene::ConstMeshPrimitivePtr meshPrimitive = IECore::runTimeCast<const IECoreScene::MeshPrimitive>( object );
+	if( !meshPrimitive )
+	{
+		return 0;
+	}
 
 	// \todo: Ideally we wouldn't copy a whole lot of data here, but just get an index buffer for tris.
 	IECoreScene::MeshPrimitivePtr meshPrimitiveTriangulated = IECore::runTimeCast<IECoreScene::MeshPrimitive>( meshPrimitive->copy() );
@@ -680,7 +695,7 @@ void fillMeshData( ConstPrimitivePtr primitive, const MVertexBufferDescriptorLis
 
 	if( !indicesTriangulated )
 	{
-		return;
+		return 0;
 	}
 
 	// Prepare the index buffer for rendering a solid mesh
@@ -725,18 +740,12 @@ void fillMeshData( ConstPrimitivePtr primitive, const MVertexBufferDescriptorLis
 
 		geometryData->wireframeIndexBuffer->commit( wireframeIndexData );
 	}
+
+	return 1; // \todo: determine cost properly
 }
 
-GeometryDataPtr boundGetter( const BoundDataCacheGetterKey &key, size_t &cost )
-{
-	cost = 1;
-
-	GeometryDataPtr boundingBoxData( new GeometryData() );
-	fillBoundData( key.m_bounds, boundingBoxData );
-	return boundingBoxData;
-}
-
-// \todo: should compute an estimate of the cost in terms of GPU memory so we can limit how much we're using.
+// \todo: the methods we dispatch to here should compute an estimate of the cost
+//        in terms of GPU memory so we can limit how much we're using.
 //        Maya lets us query the available GPU memory via MRenderer.
 GeometryDataPtr geometryGetter( const GeometryDataCacheGetterKey &key, size_t &cost )
 {
@@ -744,17 +753,20 @@ GeometryDataPtr geometryGetter( const GeometryDataCacheGetterKey &key, size_t &c
 
 	GeometryDataPtr geometryData( new GeometryData() );
 
-	switch( static_cast<IECoreScene::TypeId>( key.m_primitive->typeId() ) )
+	if( !key.object )
+	{
+		cost = fillBoundData( key.bounds, geometryData );
+		return geometryData;
+	}
+
+	switch( static_cast<IECoreScene::TypeId>( key.object->typeId() ) )
 	{
 	case IECoreScene::TypeId::MeshPrimitiveTypeId :
-		fillMeshData( key.m_primitive, key.m_descriptorList, geometryData );
-		break;
+		cost = fillMeshData( key.object, key.descriptorList, geometryData ); break;
 	case IECoreScene::TypeId::PointsPrimitiveTypeId :
-		fillPointsData( key.m_primitive, geometryData );
-		break;
+		cost = fillPointsData( key.object, geometryData ); break;
 	case IECoreScene::TypeId::CurvesPrimitiveTypeId :
-		fillCurvesData( key.m_primitive, geometryData );
-		break;
+		cost = fillCurvesData( key.object, geometryData ); break;
 	default :
 		// we should never get here as only the above types are supported, see `objectCanBeRendered`.
 		break;
@@ -763,11 +775,7 @@ GeometryDataPtr geometryGetter( const GeometryDataCacheGetterKey &key, size_t &c
 	return geometryData;
 }
 
-// Cache for BoundData
-using BoundDataCache = IECore::LRUCache<IECore::MurmurHash, GeometryDataPtr, IECore::LRUCachePolicy::Parallel, BoundDataCacheGetterKey> ;
-BoundDataCache g_boundDataCache(boundGetter, 100);
-
-// Cache for mesh data
+// Cache for geometric data
 using GeometryDataCache = IECore::LRUCache<IECore::MurmurHash, GeometryDataPtr, IECore::LRUCachePolicy::Parallel, GeometryDataCacheGetterKey>;
 GeometryDataCache g_geometryDataCache(geometryGetter, 100);
 
@@ -873,136 +881,11 @@ MRenderItem *getRenderItem( MSubSceneContainer &container, ConstObjectPtr object
 	// 	throw( IECore::Exception( boost::str( boost::format( "Could not create MRenderItem %1%." ) % name.asChar() ) ) );
 	// }
 
+	// We're not rendering anything instanced currently, so we'll benefit from consolidation in most situations
+	renderItem->setWantSubSceneConsolidation( true );
+
 	return renderItem;
 }
-
-// RenderItemWrapperPtr renderItemGetter( const RenderItemWrapperCacheGetterKey &key, size_t &cost )
-// {
-// 	cost = 1; // \todo: should do a better job at estimating the cost
-
-// 	const MBoundingBox mayaBoundingBox = IECore::convert<MBoundingBox>( key.m_boundingBox );
-// 	MString name = renderItemName( key.m_name, key.m_style );
-
-// 	// \note: data can only be added to an MRenderItem if it has been added to
-// 	// the container and has a shader assigned that determines the geometry
-// 	// requirements.
-// 	MRenderItem *renderItem = nullptr;
-// 	GeometryDataPtr geometryData;
-// 	switch( key.m_style )
-// 	{
-// 	case RenderStyle::BoundingBox :
-// 	{
-// 		renderItem = MRenderItem::Create( name, MRenderItem::DecorationItem, MGeometry::kLines);
-
-// 		renderItem->setDrawMode( MGeometry::kAll );
-// 		renderItem->castsShadows( false );
-// 		renderItem->receivesShadows( false );
-// 		renderItem->setExcludedFromPostEffects( true );
-
-// 		renderItem->setShader( key.m_shader );
-// 		key.m_container.add( renderItem );
-
-// 		geometryData = g_boundDataCache.get( BoundDataCacheGetterKey( key.m_boundingBox ) );
-// 		key.m_sceneShape->setGeometryForRenderItem( *renderItem, *(geometryData->vertexBufferArray), *(geometryData->wireframeIndexBuffer), &mayaBoundingBox );
-// 		break;
-// 	}
-// 	case RenderStyle::Wireframe :
-// 	{
-// 		ConstPrimitivePtr primitive = IECore::runTimeCast<const Primitive>( key.m_object );
-// 		if( !primitive )
-// 		{
-// 			break;
-// 		}
-
-// 		switch( static_cast<IECoreScene::TypeId>( primitive->typeId() ) )
-// 		{
-// 		case IECoreScene::TypeId::PointsPrimitiveTypeId :
-// 			renderItem = MRenderItem::Create( name, MRenderItem::DecorationItem, MGeometry::kPoints );
-// 			break;
-// 		case IECoreScene::TypeId::CurvesPrimitiveTypeId :
-// 		case IECoreScene::TypeId::MeshPrimitiveTypeId :
-// 			renderItem = MRenderItem::Create( name, MRenderItem::DecorationItem, MGeometry::kLines );
-// 			break;
-// 		default :
-// 			return nullptr;
-// 		}
-
-// 		geometryData = g_geometryDataCache.get( GeometryDataCacheGetterKey( primitive, renderItem->requiredVertexBuffers() ) );
-
-// 		renderItem->setDrawMode( MGeometry::kAll );
-// 		renderItem->castsShadows( false );
-// 		renderItem->receivesShadows( false );
-// 		renderItem->setExcludedFromPostEffects( true );
-// 		renderItem->depthPriority( MRenderItem::sActiveWireDepthPriority );
-
-// 		renderItem->setShader( key.m_shader );
-// 		key.m_container.add( renderItem );
-
-// 		key.m_sceneShape->setGeometryForRenderItem( *renderItem, *(geometryData->vertexBufferArray), *(geometryData->wireframeIndexBuffer), &mayaBoundingBox );
-// 		break;
-// 	}
-// 	case RenderStyle::Solid :
-// 	case RenderStyle::Textured :
-// 	{
-
-// 		ConstPrimitivePtr primitive = IECore::runTimeCast<const Primitive>( key.m_object );
-// 		if( !primitive )
-// 		{
-// 			break;
-// 		}
-
-// 		switch( static_cast<IECoreScene::TypeId>( primitive->typeId() ) )
-// 		{
-// 			case IECoreScene::TypeId::PointsPrimitiveTypeId :
-// 			{
-// 				renderItem = MRenderItem::Create( name, MRenderItem::DecorationItem, MGeometry::kPoints );
-// 				break;
-// 			}
-// 			case IECoreScene::TypeId::MeshPrimitiveTypeId :
-// 			{
-// 				renderItem = MRenderItem::Create( name, MRenderItem::MaterialSceneItem, MGeometry::kTriangles );
-// 				break;
-// 			}
-// 			case IECoreScene::TypeId::CurvesPrimitiveTypeId :
-// 			{
-// 				renderItem = MRenderItem::Create( name, MRenderItem::MaterialSceneItem, MGeometry::kLines );
-// 				break;
-// 			}
-// 		default :
-// 			break;
-
-// 		}
-
-// 		geometryData = g_geometryDataCache.get( GeometryDataCacheGetterKey( primitive, renderItem->requiredVertexBuffers() ) );
-
-// 		renderItem->setDrawMode( (key.m_style == RenderStyle::Solid) ? MGeometry::kShaded : MGeometry::kTextured );
-// 		renderItem->castsShadows( true );
-// 		renderItem->receivesShadows( true );
-// 		renderItem->setExcludedFromPostEffects( false );
-
-// 		renderItem->setShader( key.m_shader );
-// 		key.m_container.add( renderItem );
-
-// 		key.m_sceneShape->setGeometryForRenderItem( *renderItem, *(geometryData->vertexBufferArray), *(geometryData->indexBuffer), &mayaBoundingBox );
-// 	}
-// 	default :
-// 		break;
-// 	}
-
-// 	if( !renderItem )
-// 	{
-// 		throw( IECore::Exception( boost::str( boost::format( "Could not create MRenderItem %1%." ) % key.m_name ) ) );
-// 	}
-
-// 	// Return a copy that can be handed to Maya. We will not give up our
-// 	// internal copy as it's too easy to accidentally get it cleaned up by Maya.
-// 	RenderItemWrapperPtr visibleCopy( new RenderItemWrapper( MRenderItem::Create( *renderItem ), geometryData ) );
-
-// 	return visibleCopy;
-// }
-
-// using RenderItemCache = IECore::LRUCache<IECore::MurmurHash, RenderItemWrapperPtr, IECore::LRUCachePolicy::Parallel, RenderItemWrapperCacheGetterKey>;
-// RenderItemCache g_renderItemCache(renderItemGetter, 10000);
 
 // For the given node return the out plug on the surface shader that is assigned
 MPlug getShaderOutPlug( const MObject &sceneShapeNode )
@@ -1011,7 +894,6 @@ MPlug getShaderOutPlug( const MObject &sceneShapeNode )
 
 	MObjectArray sets, components;
 	MFnDagNode node( sceneShapeNode );
-
 	if( !node.getConnectedSetsAndMembers( 0, sets, components, true ) )
 	{
 		return result;
@@ -1157,7 +1039,14 @@ SelectionStateShaders getComponentWireShaders()
 
 TextureStateShaders getAssignedSurfaceShaders( const MObject &object )
 {
-	TextureStateShaders shaders( nullptr, nullptr );
+
+	// \todo
+	static TextureStateShaders shaders( nullptr, nullptr );
+
+	if( shaders.untextured && shaders.textured )
+	{
+		return shaders;
+	}
 
 	MRenderer* renderer = MRenderer::theRenderer();
 	if( !renderer )
@@ -1497,13 +1386,18 @@ bool SceneShapeSubSceneOverride::requiresUpdate(const MSubSceneContainer& contai
 
 void SceneShapeSubSceneOverride::update( MSubSceneContainer& container, const MFrameContext& frameContext )
 {
-	// \todo: if the scene was changed - we need to empty the container completely.
-
 	// We'll set internal state based on settings in maya and then perform
 	// updates by walking the tree.
 
 	m_time = m_sceneShape->time();
-	m_sceneInterface = m_sceneShape->getSceneInterface();
+
+	IECoreScene::ConstSceneInterfacePtr tmpSceneInterface = m_sceneShape->getSceneInterface();
+	if( m_sceneInterface != tmpSceneInterface )
+	{
+		// All data in the container is invalid now and we can safely clear it
+		container.clear();
+		m_sceneInterface = tmpSceneInterface;
+	}
 
 	// STYLE
 	const unsigned int displayStyle = frameContext.getDisplayStyle();
@@ -1645,6 +1539,12 @@ SceneShapeSubSceneOverride::SceneShapeSubSceneOverride( const MObject& obj )
 
 void SceneShapeSubSceneOverride::visitSceneLocations( ConstSceneInterfacePtr sceneInterface, RenderItemMap &renderItems, MSubSceneContainer &container, const Imath::M44d &matrix, bool isRoot )
 {
+	// \todo remove
+	if( isRoot )
+	{
+		printf( "visitSceneLocations\n" );
+	}
+
 	if( !sceneInterface )
 	{
 		return;
@@ -1703,7 +1603,7 @@ void SceneShapeSubSceneOverride::visitSceneLocations( ConstSceneInterfacePtr sce
 
 			if( isEmpty )
 			{
-				GeometryDataPtr geometryData = g_boundDataCache.get( BoundDataCacheGetterKey( boundingBox ) );
+				GeometryDataPtr geometryData = g_geometryDataCache.get( GeometryDataCacheGetterKey( nullptr, renderItem->requiredVertexBuffers(), boundingBox ) );
 				setGeometryForRenderItem( *renderItem, *(geometryData->vertexBufferArray), *(geometryData->wireframeIndexBuffer), &mayaBoundingBox );
 				m_renderItemNameToDagPath[renderItem->name().asChar()] = instance.path;
 			}
@@ -1766,127 +1666,87 @@ void SceneShapeSubSceneOverride::visitSceneLocations( ConstSceneInterfacePtr sce
 			}
 		}
 
-		// When rendering instances, we gather all matrices and associate them
-		// with a single MRenderItem. In the case of non-instanced rendering,
-		// we make sure that we have an MRenderItem per instance. This has grown
-		// around a problem we've encountered when rendering instances in Maya
-		// and will need some cleanup once we've figured out what the issue is.
+		int instanceIndex = 0;
+		std::string instanceBaseName = name +  "_" + std::to_string( (int)style );
 
-		// \note: We're passing a copy to Maya as we'd like to manage a pool of
-		// MRenderItems ourselves. We can't hand off our own MRenderItems
-		// directly because at that point Maya takes ownership and invalidates
-		// them when it sees fit (for example when clearing the container Maya
-		// gave us).
+		// For animated geometry, we create an MRenderItem per frame.
+		// Static geometry can be reused between frames and don't need an update.
+		if( sceneIsAnimated( sceneInterface ) )
+		{
+			instanceBaseName += "_" + std::to_string( m_time );
+		}
 
-		// MRenderItem *storageCopy = nullptr;
-		// if( m_instancedRendering ) // \todo: disabled and needs some work.
-		// {
-		// 	// \todo: per-instance shading
-		// 	bool componentMode = m_instances[0].componentMode;
-		// 	std::string pathKey = m_instances[0].path.fullPathName().asChar();
-		// 	bool componentSelected = m_selectedComponents[pathKey].count( componentIndex ) > 0;
-		// 	MShaderInstance *shader = getShader( m_sceneShape->thisMObject(), style, componentMode, componentMode ? componentSelected : m_instances[0].selected );
-
-		// 	RenderItemWrapperCacheGetterKey key( this, name, object, style, container, shader, bounds, /* hashName = */ false );
-		// 	RenderItemWrapperPtr renderItemWrapper = g_renderItemCache.get( key );
-		// 	// \todo: mh.
-		// 	if( !renderItemWrapper )
-		// 	{
-		// 		continue;
-		// 	}
-
-		// 	storageCopy = MRenderItem::Create( *(renderItemWrapper->get()) );
-
-		// 	std::string copyName = storageCopy->name().asChar();
-
-		// 	for( const auto &instance : m_instances )
-		// 	{
-		// 		if( style == RenderStyle::Wireframe )
-		// 		{
-		// 			if( !m_styleMask.test( (int)RenderStyle::Wireframe ) && !instance.selected && !instance.componentMode )
-		// 			{
-		// 				continue;
-		// 			}
-		// 		}
-
-		// 		MMatrix instanceMatrix = IECore::convert<MMatrix, Imath::M44d>( accumulatedMatrix * instance.transformation );
-		// 		appendMatrixToRenderItem( renderItems, copyName, storageCopy, instanceMatrix );
-		// 		m_renderItemNameToDagPath[copyName] = instance.path;
-		// 	}
-
-		// 	storageCopy->enable( true );
-		// 	storageCopy->setShader( shader ); // potentially updating an old shader for a cached render item
-		// }
-		// else
-		// {
-			int instanceIndex = 0;
-			std::string instanceBaseName = name +  "_" + std::to_string( (int)style );
-
-			// For animated geometry, we create an MRenderItem per frame.
-			// Static geometry can be reused between frames and don't need an update.
-			if( sceneIsAnimated( sceneInterface ) )
+		for( const auto &instance : m_instances )
+		{
+			if( style == RenderStyle::Wireframe ) // wireframe visibility is mostly drive by instances and needs to be handles here.
 			{
-				instanceBaseName += "_" + std::to_string( m_time );
-			}
-
-			for( const auto &instance : m_instances )
-			{
-				if( style == RenderStyle::Wireframe ) // wireframe visibility is mostly drive by instances and needs to be handles here.
+				if( !m_styleMask.test( (int)RenderStyle::Wireframe ) && !m_styleMask.test( (int)RenderStyle::Wireframe ) && !instance.selected && !instance.componentMode )
 				{
-					if( !m_styleMask.test( (int)RenderStyle::Wireframe ) && !m_styleMask.test( (int)RenderStyle::Wireframe ) && !instance.selected && !instance.componentMode )
-					{
-						continue;
-					}
-				}
-
-				std::string instanceName = instanceBaseName + std::to_string( instanceIndex++ );
-				MString itemName = renderItemName( instanceName.c_str(), style );
-
-				bool isEmpty;
-				MRenderItem *renderItem = getRenderItem( container, object, itemName, bounds, style, isEmpty );
-
-				ConstPrimitivePtr primitive = IECore::runTimeCast<const Primitive>( object );
-
-				// Before setting geometry, a shader has to be assigned so that the data requirements are clear.
-				std::string pathKey = instance.path.fullPathName().asChar();
-				bool componentSelected = m_selectedComponents[pathKey].count( componentIndex ) > 0;
-				MShaderInstance *shader = getShader( m_sceneShape->thisMObject(), style, instance.componentMode, instance.componentMode ? componentSelected : instance.selected );
-				renderItem->setShader( shader );
-
-				container.add( renderItem );
-
-				// set the geometry on the render item if it's a new one.
-				// \todo: combine the two caches (bounds and geo)
-				if( isEmpty )
-				{
-					GeometryDataPtr geometryData;
-
-					switch( style )
-					{
-					case RenderStyle::BoundingBox :
-						geometryData = g_boundDataCache.get( BoundDataCacheGetterKey( bounds ) );
-						setGeometryForRenderItem( *renderItem, *(geometryData->vertexBufferArray), *(geometryData->wireframeIndexBuffer), &mayaBoundingBox );
-						break;
-					case RenderStyle::Wireframe :
-						geometryData = g_geometryDataCache.get( GeometryDataCacheGetterKey( primitive, renderItem->requiredVertexBuffers() ) );
-						setGeometryForRenderItem( *renderItem, *(geometryData->vertexBufferArray), *(geometryData->wireframeIndexBuffer), &mayaBoundingBox );
-						break;
-					case RenderStyle::Solid :
-					case RenderStyle::Textured :
-						geometryData = g_geometryDataCache.get( GeometryDataCacheGetterKey( primitive, renderItem->requiredVertexBuffers() ) );
-						setGeometryForRenderItem( *renderItem, *(geometryData->vertexBufferArray), *(geometryData->indexBuffer), &mayaBoundingBox );
-					default :
-						break;
-					}
-
-					MMatrix instanceMatrix = IECore::convert<MMatrix, Imath::M44d>( accumulatedMatrix * instance.transformation );
-					renderItem->setMatrix( &instanceMatrix );
-					renderItem->setCustomData( new RenderItemUserData( componentIndex ) );
-					MDrawRegistry::registerComponentConverter( renderItem->name(), ComponentConverter::creator );
-					m_renderItemNameToDagPath[renderItem->name().asChar()] = instance.path;
+					continue;
 				}
 			}
-	  //}
+
+			std::string instanceName = instanceBaseName + std::to_string( instanceIndex++ );
+			MString itemName = renderItemName( instanceName.c_str(), style );
+
+			bool isEmpty;
+			MRenderItem *renderItem = getRenderItem( container, object, itemName, bounds, style, isEmpty );
+
+			ConstPrimitivePtr primitive = IECore::runTimeCast<const Primitive>( object );
+
+			// Before setting geometry, a shader has to be assigned so that the data requirements are clear.
+			std::string pathKey = instance.path.fullPathName().asChar();
+			bool componentSelected = m_selectedComponents[pathKey].count( componentIndex ) > 0;
+			MShaderInstance *shader = getShader( m_sceneShape->thisMObject(), style, instance.componentMode, instance.componentMode ? componentSelected : instance.selected );
+			// printf( "Assigning shader: %p\n", shader );
+			renderItem->setShader( shader );
+
+			container.add( renderItem );
+
+			// set the geometry on the render item if it's a new one.
+			if( isEmpty )
+			{
+				GeometryDataPtr geometryData;
+
+				switch( style )
+				{
+				case RenderStyle::BoundingBox :
+					geometryData = g_geometryDataCache.get( GeometryDataCacheGetterKey( nullptr, renderItem->requiredVertexBuffers(), bounds ) );
+					setGeometryForRenderItem( *renderItem, *(geometryData->vertexBufferArray), *(geometryData->wireframeIndexBuffer), &mayaBoundingBox );
+					break;
+				case RenderStyle::Wireframe :
+					geometryData = g_geometryDataCache.get( GeometryDataCacheGetterKey( primitive, renderItem->requiredVertexBuffers(), bounds ) );
+					setGeometryForRenderItem( *renderItem, *(geometryData->vertexBufferArray), *(geometryData->wireframeIndexBuffer), &mayaBoundingBox );
+					break;
+				case RenderStyle::Solid :
+				case RenderStyle::Textured :
+					geometryData = g_geometryDataCache.get( GeometryDataCacheGetterKey( primitive, renderItem->requiredVertexBuffers(), bounds ) );
+					setGeometryForRenderItem( *renderItem, *(geometryData->vertexBufferArray), *(geometryData->indexBuffer), &mayaBoundingBox );
+				default :
+					break;
+				}
+
+				// if( instancing && geometryData->dataView )
+				// {
+
+				// }
+				// else
+				// {
+
+				// }
+
+				// if( !geometryData->dataView )
+				// {
+				// 	geometryData->dataView = renderItem;
+				// }
+
+				MMatrix instanceMatrix = IECore::convert<MMatrix, Imath::M44d>( accumulatedMatrix * instance.transformation );
+				renderItem->setMatrix( &instanceMatrix );
+				renderItem->setCustomData( RenderItemUserData::create( componentIndex ) );
+				MDrawRegistry::registerComponentConverter( renderItem->name(), ComponentConverter::creator );
+				m_renderItemNameToDagPath[renderItem->name().asChar()] = instance.path;
+			}
+		}
 	}
 }
 
