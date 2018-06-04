@@ -674,7 +674,7 @@ MString renderItemName( const std::string &baseName, RenderStyle style )
 	}
 }
 
-MRenderItem *getRenderItem( MSubSceneContainer &container, ConstObjectPtr object, const MString &name, const Imath::Box3f &boundingBox, RenderStyle style, bool &isEmpty )
+MRenderItem *getRenderItem( MSubSceneContainer &container, ConstObjectPtr object, const MString &name, RenderStyle style, bool &isEmpty )
 {
 	MRenderItem *renderItem = container.find( name );
 	if( renderItem )
@@ -687,7 +687,6 @@ MRenderItem *getRenderItem( MSubSceneContainer &container, ConstObjectPtr object
 	// If the container does not have an appropriate MRenderItem yet, we'll construct an empty one.
 	isEmpty = true;
 
-	// GeometryDataPtr geometryData;
 	switch( style )
 	{
 	case RenderStyle::BoundingBox :
@@ -727,7 +726,7 @@ MRenderItem *getRenderItem( MSubSceneContainer &container, ConstObjectPtr object
 		{
 			case IECoreScene::TypeId::PointsPrimitiveTypeId :
 			{
-				renderItem = MRenderItem::Create( name, MRenderItem::DecorationItem, MGeometry::kPoints );
+				renderItem = MRenderItem::Create( name, MRenderItem::MaterialSceneItem, MGeometry::kPoints );
 				break;
 			}
 			case IECoreScene::TypeId::MeshPrimitiveTypeId :
@@ -1385,10 +1384,6 @@ void SceneShapeSubSceneOverride::update( MSubSceneContainer& container, const MF
 		m_materialIsDirty = true;
 	}
 
-	// Perform update
-	m_renderItemNameToDagPath.clear();
-	// container.clear(); // Clear out previous render items so that they don't interfere with new ones.
-
 	// Disable all MRenderItems before traversing the scene
 	// \todo: performance improvement -> we don't have to do this is all that changed is a shader (selection state) for example.
 	MSubSceneContainer::Iterator *it = container.getIterator();
@@ -1399,44 +1394,10 @@ void SceneShapeSubSceneOverride::update( MSubSceneContainer& container, const MF
 	}
 	it->destroy();
 
-	// Store MRenderItems to be added while walking the tree.
+	// Create and enable MRenderItems while traversing the scene hierarchy
 	RenderItemMap renderItems;
 	visitSceneLocations( m_sceneInterface, renderItems, container, Imath::M44d(), /* isRoot = */ true );
 
-	// container.clear(); // MRenderItems might have been added temporarily so that Maya lets us fill them
-
-	// // Actually add all gathered MRenderItems while using instancing where possible
-	// for( auto namedRenderItem : renderItems )
-	// {
-	// 	auto itemAndMatrices = namedRenderItem.second;
-	// 	MRenderItem *renderItem = itemAndMatrices.first;
-
-	// 	if( !renderItem )
-	// 	{
-	// 		continue;
-	// 	}
-
-	// 	// \todo
-	// 	container.add( renderItem );
-
-	// 	// note: the following is true for all entries if
-	// 	// !m_instancedRendering because we're creating a separate
-	// 	// render item per instance
-	// 	if( itemAndMatrices.second.length() == 1 )
-	// 	{
-	// 		renderItem->setWantSubSceneConsolidation( true );
-	// 		renderItem->setMatrix( &itemAndMatrices.second[0] );
-	// 	}
-	// 	else
-	// 	{
-	// 		renderItem->setWantSubSceneConsolidation( false );
-	// 		setInstanceTransformArray( *renderItem, itemAndMatrices.second );
-	// 		// \todo: we should make sure that we can select individual
-	// 		// instances. For now instanced rendering is disabled anyway,
-	// 		// though, because of a problem in Maya that I don't quite
-	// 		// understand.
-	// 	}
-	// }
 }
 
 bool SceneShapeSubSceneOverride::getInstancedSelectionPath( const MRenderItem &renderItem, const MIntersection &intersection, MDagPath &dagPath ) const
@@ -1544,7 +1505,7 @@ void SceneShapeSubSceneOverride::visitSceneLocations( ConstSceneInterfacePtr sce
 
 			bool isEmpty;
 			MString itemName = renderItemName( instanceName, RenderStyle::BoundingBox );
-			MRenderItem *renderItem = getRenderItem( container, IECore::NullObject::defaultNullObject(), itemName, boundingBox, RenderStyle::BoundingBox, isEmpty );
+			MRenderItem *renderItem = getRenderItem( container, IECore::NullObject::defaultNullObject(), itemName, RenderStyle::BoundingBox, isEmpty );
 
 			MShaderInstance *shader = getShader( m_sceneShape->thisMObject(), RenderStyle::BoundingBox, instance.componentMode, /* isComponentSelected = */ false );
 			renderItem->setShader( shader );
@@ -1640,9 +1601,7 @@ void SceneShapeSubSceneOverride::visitSceneLocations( ConstSceneInterfacePtr sce
 			MString itemName = renderItemName( instanceName.c_str(), style );
 
 			bool isEmpty;
-			MRenderItem *renderItem = getRenderItem( container, object, itemName, bounds, style, isEmpty );
-
-			ConstPrimitivePtr primitive = IECore::runTimeCast<const Primitive>( object );
+			MRenderItem *renderItem = getRenderItem( container, object, itemName, style, isEmpty );
 
 			// Before setting geometry, a shader has to be assigned so that the data requirements are clear.
 			std::string pathKey = instance.path.fullPathName().asChar();
@@ -1655,11 +1614,13 @@ void SceneShapeSubSceneOverride::visitSceneLocations( ConstSceneInterfacePtr sce
 			// set the geometry on the render item if it's a new one.
 			if( isEmpty )
 			{
+				ConstPrimitivePtr primitive = IECore::runTimeCast<const Primitive>( object );
 				GeometryDataPtr geometryData;
 
 				switch( style )
 				{
 				case RenderStyle::BoundingBox :
+					// We're only insterested in a BoundingBox here and can ignore the primitive completely.
 					geometryData = g_geometryDataCache.get( GeometryDataCacheGetterKey( nullptr, renderItem->requiredVertexBuffers(), bounds ) );
 					setGeometryForRenderItem( *renderItem, *(geometryData->vertexBufferArray), *(geometryData->wireframeIndexBuffer), &mayaBoundingBox );
 					break;
