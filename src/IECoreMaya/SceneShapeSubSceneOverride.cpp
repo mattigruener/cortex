@@ -118,128 +118,6 @@ struct GeometryData
 
 using GeometryDataPtr = std::shared_ptr<GeometryData>;
 
-// Wrap Maya's MRenderItem so that we get a shareable pointer that we can return
-// from a cache. This is intended to only ever hold MRenderItem's that Maya are
-// not going to see as those need separate cleaning up.
-// \todo is this specifier needed?
-// class IECOREMAYA_API RenderItemWrapper : public IECore::RefCounted
-// {
-// 	public :
-
-// 		RenderItemWrapper( MHWRender::MRenderItem *renderItem, GeometryDataPtr geometryData )
-// 			: m_renderItem( renderItem ), m_geometryData( geometryData )
-// 		{
-// 		}
-
-// 		~RenderItemWrapper()
-// 		{
-// 			MRenderItem::Destroy( m_renderItem );
-// 		}
-
-// 		MHWRender::MRenderItem* get() { return m_renderItem; }
-
-// 	private :
-
-// 		MHWRender::MRenderItem *m_renderItem;
-
-// 		// Holding on to this in order to ensure the geometry data we've passed
-// 		// to the render item is kept alive for as long as someone might take
-// 		// copies of this render item.
-// 		GeometryDataPtr m_geometryData;
-// };
-
-// IE_CORE_DECLAREPTR( RenderItemWrapper );
-
-// Data stored per MRenderItem. We make sure that we only have a single instance
-// for equivalent data as Maya is taking the user data into account when making
-// consolidation decisions.
-class RenderItemUserData : public MUserData
-{
-	public :
-
-		static RenderItemUserData* create( int componentIndex )
-		{
-			const auto &entry = RenderItemUserData::s_map.find( componentIndex );
-			if( entry != RenderItemUserData::s_map.end() )
-			{
-				return entry->second;
-			}
-
-			RenderItemUserData *data = new RenderItemUserData( componentIndex );
-			RenderItemUserData::s_map.emplace( componentIndex, data );
-			return data;
-		}
-
-		RenderItemUserData( int componentIndex )
-			: MUserData( true ),  // delete when render item is deleted
-			  componentIndex( componentIndex )
-		{
-		}
-
-		virtual ~RenderItemUserData()
-		{
-		}
-
-		int componentIndex;
-
-	private :
-
-	  static std::map<int, RenderItemUserData*> s_map;
-
-};
-
-std::map<int, RenderItemUserData*> RenderItemUserData::s_map;
-
-// As we render a render item per component, all we need to know here is the
-// component index per render item.
-class ComponentConverter : public MPxComponentConverter
-{
-	public :
-
-		static MPxComponentConverter *creator()
-		{
-			return new ComponentConverter();
-		}
-
-		ComponentConverter()
-			: MHWRender::MPxComponentConverter()
-		{
-		}
-
-		~ComponentConverter() override
-		{
-		}
-
-		void initialize( const MRenderItem &renderItem ) override
-		{
-			RenderItemUserData* userData = dynamic_cast<RenderItemUserData*>(renderItem.customData());
-			m_idx = userData->componentIndex;
-
-			m_object = m_component.create( MFn::kMeshPolygonComponent );
-		}
-
-		void addIntersection( MIntersection &intersection ) override
-		{
-			m_component.addElement( m_idx );
-		}
-
-		MObject component()
-		{
-			return m_object;
-		}
-
-		MSelectionMask 	selectionMask () const override
-		{
-			return MSelectionMask::kSelectMeshFaces;
-		}
-
-	private :
-
-		MFnSingleIndexedComponent m_component;
-		MObject m_object;
-		int m_idx;
-};
-
 bool objectCanBeRendered( IECore::ConstObjectPtr object )
 {
 	switch( static_cast<IECoreScene::TypeId>( object->typeId() ) )
@@ -1272,6 +1150,74 @@ void selectedComponentIndices( const MObject &object, IndexMap &indexMap )
 
 } // namespace
 
+class IECoreMaya::RenderItemUserData : public MUserData
+{
+public :
+
+	RenderItemUserData( int componentIndex )
+		: MUserData( false ),  // do not delete when render item is deleted, we manage life time
+		  componentIndex( componentIndex )
+	{
+	}
+
+	virtual ~RenderItemUserData()
+	{
+	}
+
+	int componentIndex;
+
+};
+
+// As we render a render item per component, all we need to know here is the
+// component index per render item.
+class ComponentConverter : public MPxComponentConverter
+{
+	public :
+
+		static MPxComponentConverter *creator()
+		{
+			return new ComponentConverter();
+		}
+
+		ComponentConverter()
+			: MHWRender::MPxComponentConverter()
+		{
+		}
+
+		~ComponentConverter() override
+		{
+		}
+
+		void initialize( const MRenderItem &renderItem ) override
+		{
+			RenderItemUserData *userData = dynamic_cast<RenderItemUserData*>(renderItem.customData());
+			m_idx = userData->componentIndex;
+
+			m_object = m_component.create( MFn::kMeshPolygonComponent );
+		}
+
+		void addIntersection( MIntersection &intersection ) override
+		{
+			m_component.addElement( m_idx );
+		}
+
+		MObject component()
+		{
+			return m_object;
+		}
+
+		MSelectionMask 	selectionMask () const override
+		{
+			return MSelectionMask::kSelectMeshFaces;
+		}
+
+	private :
+
+		MFnSingleIndexedComponent m_component;
+		MObject m_object;
+		int m_idx;
+};
+
 MString& SceneShapeSubSceneOverride::drawDbClassification()
 {
 	static MString classification{ "drawdb/subscene/ieSceneShape" };
@@ -1495,6 +1441,7 @@ void SceneShapeSubSceneOverride::update( MSubSceneContainer& container, const MF
 
 bool SceneShapeSubSceneOverride::getInstancedSelectionPath( const MRenderItem &renderItem, const MIntersection &intersection, MDagPath &dagPath ) const
 {
+	printf("|getInstancedSelectionPath\n");
 	auto it = m_renderItemNameToDagPath.find( std::string( renderItem.name().asChar() ) );
 	if( it != m_renderItemNameToDagPath.end() )
 	{
@@ -1507,15 +1454,18 @@ bool SceneShapeSubSceneOverride::getInstancedSelectionPath( const MRenderItem &r
 
 void SceneShapeSubSceneOverride::updateSelectionGranularity( const MDagPath &path, MSelectionContext &selectionContext )
 {
+	printf( "called\n" );
 	MDagPath parent( path );
 	parent.pop();
 
 	if( componentsSelectable( parent ) )
 	{
+		printf("comp\n");
 		selectionContext.setSelectionLevel( MHWRender::MSelectionContext::kComponent );
 	}
 	else
 	{
+		printf("obj\n");
 		selectionContext.setSelectionLevel( MHWRender::MSelectionContext::kObject );
 	}
 }
@@ -1698,7 +1648,6 @@ void SceneShapeSubSceneOverride::visitSceneLocations( ConstSceneInterfacePtr sce
 			std::string pathKey = instance.path.fullPathName().asChar();
 			bool componentSelected = m_selectedComponents[pathKey].count( componentIndex ) > 0;
 			MShaderInstance *shader = getShader( m_sceneShape->thisMObject(), style, instance.componentMode, instance.componentMode ? componentSelected : instance.selected );
-			// printf( "Assigning shader: %p\n", shader );
 			renderItem->setShader( shader );
 
 			container.add( renderItem );
@@ -1726,23 +1675,10 @@ void SceneShapeSubSceneOverride::visitSceneLocations( ConstSceneInterfacePtr sce
 					break;
 				}
 
-				// if( instancing && geometryData->dataView )
-				// {
-
-				// }
-				// else
-				// {
-
-				// }
-
-				// if( !geometryData->dataView )
-				// {
-				// 	geometryData->dataView = renderItem;
-				// }
-
 				MMatrix instanceMatrix = IECore::convert<MMatrix, Imath::M44d>( accumulatedMatrix * instance.transformation );
 				renderItem->setMatrix( &instanceMatrix );
-				renderItem->setCustomData( RenderItemUserData::create( componentIndex ) );
+				RenderItemUserDataPtr userData = getUserData( componentIndex );
+				renderItem->setCustomData( userData.get() );
 				MDrawRegistry::registerComponentConverter( renderItem->name(), ComponentConverter::creator );
 				m_renderItemNameToDagPath[renderItem->name().asChar()] = instance.path;
 			}
@@ -1834,3 +1770,15 @@ bool SceneShapeSubSceneOverride::renderAllShaded( unsigned int displayStyle ) co
 	return false;
 }
 
+RenderItemUserDataPtr SceneShapeSubSceneOverride::getUserData( int componentIndex )
+{
+	const auto &entry = m_userDataMap.find( componentIndex );
+	if( entry != m_userDataMap.end() )
+		{
+			return entry->second;
+		}
+
+	RenderItemUserDataPtr data( new RenderItemUserData( componentIndex ) );
+	m_userDataMap.emplace( componentIndex, data );
+	return data;
+}

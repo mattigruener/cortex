@@ -50,10 +50,6 @@
 #include "maya/MPxSubSceneOverride.h"
 #include "maya/MSelectionContext.h"
 
-namespace
-{
-}
-
 namespace IECoreMaya
 {
 
@@ -61,6 +57,9 @@ enum class RenderStyle { BoundingBox, Wireframe, Solid, Textured, Last };
 
 using IndexMap = std::map<const std::string, std::set<int> >;
 using RenderItemMap = std::map<const std::string, std::pair<MHWRender::MRenderItem*, MMatrixArray> >;
+
+class RenderItemUserData;
+using RenderItemUserDataPtr = std::shared_ptr<RenderItemUserData>;
 
 class IECOREMAYA_API SceneShapeSubSceneOverride : public MHWRender::MPxSubSceneOverride
 {
@@ -127,6 +126,9 @@ class IECOREMAYA_API SceneShapeSubSceneOverride : public MHWRender::MPxSubSceneO
 		bool renderAllWireframes( unsigned int displayStyle ) const;
 		bool renderAllShaded( unsigned int displayStyle ) const;
 
+		// \todo: doc
+		RenderItemUserDataPtr getUserData( int componentIndex );
+
 		SceneShape *m_sceneShape;
 
 		std::string m_drawTagsFilter;
@@ -144,6 +146,7 @@ class IECOREMAYA_API SceneShapeSubSceneOverride : public MHWRender::MPxSubSceneO
 
 		std::map<const std::string, MDagPath> m_renderItemNameToDagPath;
 		IndexMap m_selectedComponents;
+		std::map<int, RenderItemUserDataPtr> m_userDataMap;
 };
 
 } // namespace IECoreMaya

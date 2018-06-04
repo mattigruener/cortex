@@ -1096,12 +1096,14 @@ MPxSurfaceShape::MatchResult SceneShapeInterface::matchComponent( const MSelecti
 
 MSelectionMask SceneShapeInterface::getShapeSelectionMask() const
 {
+	printf("foo\n");
 	MSelectionMask retVal( MSelectionMask::kSelectMeshes );
 	return retVal;
 }
 
 MSelectionMask SceneShapeInterface::getComponentSelectionMask() const
 {
+	printf("bar\n");
 	MSelectionMask retVal( MSelectionMask::kSelectMeshFaces );
 	return retVal;
 }
