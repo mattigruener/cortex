@@ -510,9 +510,6 @@ MRenderItem *acquireRenderItem( MSubSceneContainer &container, ConstObjectPtr ob
 
 	container.add( renderItem );
 
-	// We're not rendering anything instanced currently, so we'll benefit from consolidation in most situations
-	renderItem->setWantSubSceneConsolidation( true );
-
 	return renderItem;
 }
 
@@ -1139,6 +1136,7 @@ void SceneShapeSubSceneOverride::update( MSubSceneContainer& container, const MF
 	while( (renderItem = it->next()) != nullptr )
 	{
 		renderItem->enable( false );
+		removeAllInstances( *renderItem );
 	}
 	it->destroy();
 
@@ -1280,7 +1278,14 @@ void SceneShapeSubSceneOverride::visitSceneLocations( const SceneInterface *scen
 	}
 
 	IECore::ConstObjectPtr object = sceneInterface->readObject( m_time );
+
 	if( !objectCanBeRendered( object ) )
+	{
+		return;
+	}
+
+	ConstPrimitivePtr primitive = IECore::runTimeCast<const Primitive>( object );
+	if( !primitive )
 	{
 		return;
 	}
@@ -1290,6 +1295,10 @@ void SceneShapeSubSceneOverride::visitSceneLocations( const SceneInterface *scen
 	const MBoundingBox mayaBoundingBox = IECore::convert<MBoundingBox>( boundingBox ); //\todo: can this be constructed from Box3d?
 
 	int componentIndex = m_sceneShape->selectionIndex( name );
+
+	// Hash primitive only once
+	IECore::MurmurHash primitiveHash;
+	primitive->hash( primitiveHash );
 
 	// Adding RenderItems as needed
 	// ----------------------------
@@ -1319,15 +1328,11 @@ void SceneShapeSubSceneOverride::visitSceneLocations( const SceneInterface *scen
 			}
 		}
 
-		int instanceIndex = 0;
-		std::string instanceBaseName = name +  "_" + std::to_string( (int)style );
+		MString itemName;
+		IECore::MurmurHash styleHash = primitiveHash; // copy
 
-		// For animated geometry, we create an MRenderItem per frame.
-		// Static geometry can be reused between frames and doesn't need an update.
-		if( sceneIsAnimated( sceneInterface ) )
-		{
-			instanceBaseName += "_" + std::to_string( m_time );
-		}
+		styleHash.append( (int)style );
+		itemName = MString( styleHash.toString().c_str() );
 
 		for( const auto &instance : m_instances )
 		{
@@ -1339,9 +1344,6 @@ void SceneShapeSubSceneOverride::visitSceneLocations( const SceneInterface *scen
 				}
 			}
 
-			std::string instanceName = instanceBaseName + "_" + std::to_string( instanceIndex++ );
-			MString itemName( instanceName.c_str() );
-
 			bool isNew;
 			MRenderItem *renderItem = acquireRenderItem( container, object, itemName, style, isNew );
 
@@ -1350,9 +1352,6 @@ void SceneShapeSubSceneOverride::visitSceneLocations( const SceneInterface *scen
 			bool componentSelected = m_selectedComponents[pathKey].count( componentIndex ) > 0;
 			MShaderInstance *shader = getShader( m_sceneShape->thisMObject(), style, instance.componentMode, instance.componentMode ? componentSelected : instance.selected );
 			renderItem->setShader( shader );
-
-			MMatrix instanceMatrix = IECore::convert<MMatrix, Imath::M44d>( accumulatedMatrix * instance.transformation );
-			renderItem->setMatrix( &instanceMatrix );
 
 			// set the geometry on the render item if it's a new one.
 			if( isNew )
@@ -1380,6 +1379,10 @@ void SceneShapeSubSceneOverride::visitSceneLocations( const SceneInterface *scen
 
 				m_renderItemNameToDagPath[renderItem->name().asChar()] = instance.path;
 			}
+
+			MMatrix instanceMatrix = IECore::convert<MMatrix, Imath::M44d>( accumulatedMatrix * instance.transformation );
+			// renderItem->setMatrix( &instanceMatrix );             // Geometry does not get culled.
+			addInstanceTransform( *renderItem, instanceMatrix );     // Geometry seems to get frustum culled.
 		}
 	}
 }
